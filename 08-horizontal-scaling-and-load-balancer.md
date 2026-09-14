@@ -288,3 +288,4 @@ Distributed systems are mostly about solving these new problems.
 - A load balancer provides one public endpoint and distributes requests to healthy backend servers.
 - Backend servers usually share a database initially, but they do **not** share RAM or local memory.
 - Horizontal scaling improves throughput and availability but introduces state-sharing and consistency challenges.
+- Local cache is commonly used in production for cacheable data (config, product catalog, feature flags, etc.), but not for user sessions in horizontally scaled systems.
