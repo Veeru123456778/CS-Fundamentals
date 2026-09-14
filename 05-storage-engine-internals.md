@@ -474,36 +474,54 @@ No partial update remains.
 
 ---
 
-# 19. Why Does MVCC Need the Undo Log?
+## 19. Why Does MVCC Need the Undo Log?
 
-MVCC allows transactions to see **older committed versions**.
+MVCC allows different transactions to see different committed versions of the same row.
 
-Example:
+**Important:** The database does **not** keep separate "committed" and "uncommitted" tables.
+
+Instead:
+
+- The **current version** of a row lives in the table page (Buffer Pool / SSD).
+- The **Undo Log** stores older versions of that row.
+- Every row contains transaction metadata (`transaction_id` and an undo pointer) that MVCC uses to determine visibility.
+
+### Example
 
 Initial committed value:
 
-```text
-Stock = 10
+| product_id | stock |
+|------------|-------|
+| 101 | **10** |
+
+Transaction **T1** updates the row:
+
+```sql
+BEGIN;
+
+UPDATE inventory
+SET stock = 9
+WHERE product_id = 101;
 ```
 
-Transaction T1 updates stock to `9`.
+Internal state:
 
-Buffer Pool now contains `9`.
-
-Transaction T2 started earlier and still needs the snapshot value `10`.
-
-### Where Does `10` Come From?
-
-The database reconstructs it using the Undo Log.
-
-### Internal View
-
-| Component | Value |
+| Location | Value |
 |----------|-------|
-| Current Row | 9 |
-| Undo Log | Previous value = 10 |
+| **Current Row** | `stock = 9` *(written by T1)* |
+| **Undo Log** | Previous version: `stock = 10` |
 
-This is how Repeatable Read provides a consistent snapshot.
+Now:
+
+- **T1** reads `9` because a transaction always sees its own writes.
+- **T2** (whose snapshot requires the older committed version) follows the undo pointer and reconstructs `10`.
+
+### Key Takeaway
+
+MVCC uses the transaction's snapshot to decide whether to return:
+
+- The **current row**, or
+- An **older committed version reconstructed from the Undo Log**.
 
 ---
 
