@@ -83,6 +83,33 @@ Behavior:
 - Multiple transactions can hold shared locks on the same row.
 - Exclusive locks are blocked until all shared locks are released.
 
+
+## Does a Normal SELECT Acquire a Shared Lock?
+
+No.
+
+A normal `SELECT` is a **non-locking read** in InnoDB and uses MVCC to read a committed snapshot.
+
+A shared lock is acquired only when explicitly requested using `FOR SHARE` (or similar locking reads).
+
+
+## When Should FOR SHARE Be Used?
+
+Use `FOR SHARE` when a transaction needs to read data and ensure that no other transaction modifies those rows until the current transaction finishes.
+
+Example:
+
+- Read inventory.
+- Perform business validation.
+- Continue using the same inventory value inside the transaction.
+
+
+## Inventory Example: Why Use FOR UPDATE Instead of FOR SHARE?
+
+If two transactions both acquire a shared lock and later try to update the same row, both will need to upgrade to an exclusive lock, creating lock contention or a deadlock.
+
+For read-modify-write operations like inventory deduction, `FOR UPDATE` is the correct locking strategy because it acquires the exclusive lock at the beginning.
+
 ---
 
 # 5. Exclusive Lock (X Lock)
