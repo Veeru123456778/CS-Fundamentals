@@ -639,7 +639,7 @@ Provides maximum correctness but lowest concurrency.
 |-----------------|-----------|---------------------|--------------|
 | Read Uncommitted | ✅ Possible | ✅ Possible | ✅ Possible |
 | Read Committed | ❌ Prevented | ✅ Possible | ✅ Possible |
-| Repeatable Read (MySQL) | ❌ Prevented | ❌ Prevented | ❌ Prevented (using MVCC + Gap Locks) |
+| Repeatable Read (MySQL) | ❌ Prevented | ❌ Prevented | ❌ Prevented for locking reads using Next-Key/Gap Locks; snapshot reads use MVCC |
 | Serializable | ❌ Prevented | ❌ Prevented | ❌ Prevented |
 
 ---
