@@ -265,3 +265,363 @@ This is the motivation for the next solutions.
 - Local cache includes sessions but also many other cached objects.
 - Local RAM is private to one server, so horizontal scaling breaks in-memory sessions.
 - The session problem is the first major consistency challenge introduced by multiple backend servers.
+
+
+
+# Stateless Services and Session Management (Part 2)
+
+## Goal
+
+Understand how distributed systems solve the session problem using Sticky Sessions, Redis, and JWT, and learn which approach is used in production systems.
+
+---
+
+# 13. Solution 1 — Sticky Sessions
+
+The simplest solution is to always send the same user to the same backend server.
+
+### How it works
+
+1. User logs in.
+2. Load balancer routes login request to **Server A**.
+3. Server A creates the session in its RAM.
+4. Load balancer remembers that this user should always go to Server A.
+
+```mermaid
+flowchart LR
+    U["User"]
+
+    LB["Load Balancer"]
+
+    A["Server A<br/>Session: abc123"]
+    B["Server B"]
+    C["Server C"]
+
+    U --> LB
+    LB --> A
+    LB -. "Same user always routed here" .-> A
+```
+
+The user's future requests always reach Server A.
+
+---
+
+# 14. How Does the Load Balancer Remember?
+
+The load balancer creates an **affinity** between the client and a backend server.
+
+Common techniques:
+
+| Technique | Example |
+|-----------|---------|
+| Cookie-based affinity | Load balancer sets its own cookie. |
+| IP Hash | Same client IP hashes to same server. |
+| Session Cookie Hash | Session ID determines backend server. |
+
+The backend application does not need to know this logic.
+
+---
+
+# 15. Why Sticky Sessions Are Attractive
+
+Advantages:
+
+- Very easy to implement.
+- Existing in-memory sessions continue working.
+- No extra infrastructure required.
+
+Works well for small deployments.
+
+---
+
+# 16. Problems with Sticky Sessions
+
+Sticky sessions create several distributed system problems.
+
+### Problem 1 — Server Failure
+
+Session exists only on Server A.
+
+Server A crashes.
+
+Result:
+
+- Session disappears.
+- User logs in again.
+
+### Problem 2 — Uneven Load
+
+Suppose Server A has 50,000 active users.
+
+Server B has only 5,000.
+
+Sticky routing prevents balancing traffic evenly.
+
+### Problem 3 — Scaling
+
+Adding a new server does not move existing sessions automatically.
+
+Some servers remain overloaded.
+
+---
+
+# 17. Why Large Systems Avoid Sticky Sessions
+
+Sticky sessions reduce one benefit of horizontal scaling.
+
+Instead of "any server can serve any request",
+
+it becomes
+
+"this user must reach one specific server."
+
+That limits flexibility and failover.
+
+---
+
+# 18. Solution 2 — Shared Session Store (Redis)
+
+Instead of storing sessions in server RAM, store them in **one shared data store**.
+
+### Architecture
+
+```mermaid
+flowchart TD
+    U["Users"]
+
+    LB["Load Balancer"]
+
+    S1["Server A"]
+    S2["Server B"]
+    S3["Server C"]
+
+    R["Redis Session Store"]
+
+    U --> LB
+
+    LB --> S1
+    LB --> S2
+    LB --> S3
+
+    S1 --> R
+    S2 --> R
+    S3 --> R
+```
+
+Every server reads and writes sessions from Redis.
+
+---
+
+# 19. Login Flow with Redis
+
+### Login
+
+1. User logs in through Server A.
+2. Server A authenticates credentials.
+3. Session stored in Redis.
+4. Redis returns success.
+5. Session ID sent to client.
+
+### Next Request
+
+1. Load balancer sends request to Server B.
+2. Server B reads Session ID.
+3. Fetches session from Redis.
+4. User remains authenticated.
+
+Now **any server** can serve the request.
+
+---
+
+# 20. What Does Redis Store?
+
+Conceptually:
+
+| Session ID | Session Data |
+|------------|--------------|
+| abc123 | userId=5, role=USER |
+| xyz789 | userId=8, role=ADMIN |
+
+Redis stores these entries in memory.
+
+Each session usually has an expiration time (TTL).
+
+---
+
+# 21. What Happens if a Backend Server Restarts?
+
+Suppose Server B restarts.
+
+Result:
+
+- Backend RAM is cleared.
+- Session still exists in Redis.
+- User continues without logging in again.
+
+This is a huge improvement over local sessions.
+
+---
+
+# 22. Why Is Redis Better Than Local Sessions?
+
+| Local Session | Redis Session |
+|---------------|---------------|
+| Stored in one server's RAM. | Stored in shared Redis. |
+| Lost on server restart. | Survives backend restart. |
+| Requires sticky routing. | Any server can serve the request. |
+| Difficult horizontal scaling. | Easy horizontal scaling. |
+
+---
+
+# 23. Does Redis Become a Single Point of Failure?
+
+Potentially yes.
+
+Production systems usually run:
+
+- Redis primary.
+- Redis replicas.
+- Automatic failover (Redis Sentinel/Cluster).
+
+We'll study Redis architecture in the next section.
+
+---
+
+# 24. Solution 3 — JWT (JSON Web Token)
+
+JWT takes a completely different approach.
+
+**No session is stored on the backend.**
+
+### Login
+
+1. User logs in.
+2. Backend creates a signed JWT.
+3. JWT sent to client.
+4. Client stores the token.
+
+Every future request includes the token.
+
+---
+
+# 25. JWT Request Flow
+
+```text
+User Login
+      │
+      ▼
+Backend creates JWT
+      │
+      ▼
+Client stores JWT
+      │
+      ▼
+Every request sends JWT
+      │
+      ▼
+Any backend verifies signature
+```
+
+No Redis lookup is required.
+
+---
+
+# 26. What Does a JWT Contain?
+
+Example payload:
+
+```json
+{
+  "userId": 5,
+  "role": "USER",
+  "exp": 1760000000
+}
+```
+
+It contains:
+
+- User identity.
+- Claims.
+- Expiration timestamp.
+
+The token is digitally signed.
+
+---
+
+# 27. Why Can't Users Modify a JWT?
+
+JWT is signed using a server secret or private key.
+
+If payload changes:
+
+- Signature becomes invalid.
+- Backend rejects the token.
+
+The client can read the payload but cannot forge a valid signature.
+
+---
+
+# 28. JWT vs Session
+
+| Session | JWT |
+|---------|-----|
+| State stored on server. | State stored in client token. |
+| Requires lookup (RAM/Redis). | No lookup required for authentication. |
+| Easy logout by deleting session. | Logout is harder until token expires. |
+| Can revoke immediately. | Requires blacklist/short expiry for revocation. |
+
+---
+
+# 29. Which Approach is Used in Production?
+
+There is no single answer.
+
+### Small Applications
+
+- Local sessions.
+
+### Medium Applications
+
+- Redis sessions.
+
+### Large Microservices
+
+- JWT access tokens.
+- Redis for refresh tokens or session revocation.
+- Hybrid authentication is very common.
+
+---
+
+# 30. Redis vs JWT — When to Use Which?
+
+| Use Case | Preferred Approach |
+|----------|--------------------|
+| Web application with server-managed login | Redis Sessions |
+| Mobile APIs / Microservices | JWT |
+| Immediate logout everywhere | Redis Session or JWT blacklist |
+| Stateless REST APIs | JWT |
+| Need shared login across servers | Redis or JWT |
+
+---
+
+# 31. What Did We Learn?
+
+Horizontal scaling introduced distributed state.
+
+We solved it in three stages:
+
+1. Sticky Sessions — simplest but limited.
+2. Redis Session Store — shared state across servers.
+3. JWT — remove server-side session state entirely.
+
+This is the transition from **stateful servers** to **stateless distributed services**.
+
+---
+
+# Interview Takeaways
+
+- Sticky Sessions keep users on one backend server but reduce flexibility and failover.
+- Redis allows all backend servers to share session state.
+- JWT stores authentication state inside a signed client token, making backend servers stateless.
+- Stateless services are easier to scale horizontally because any server can handle any request.
+- Large production systems commonly use a hybrid approach: JWT for authentication and Redis for refresh tokens or session management.
