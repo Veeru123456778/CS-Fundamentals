@@ -171,7 +171,7 @@ https://blinkit.com
 Internally:
 
 - Browser connects to **443**.
-- Nginx forwards request to **8080**.
+- Nginx listens the request traffic on port 443, when browser connects to port 443 (using our Nginx IP Address) and browser sends the request to Nginx then it forwards request to **8080** (Our application port).
 - User never sees port **8080**.
 
 ---
