@@ -364,3 +364,398 @@ TTL helps Redis clean temporary data automatically.
 - Cache hits avoid database queries; cache misses fetch from the database and populate Redis.
 - TTL automatically removes temporary data such as sessions and OTPs.
 - Redis becomes the shared cache that solves the local-cache problem introduced by horizontal scaling.
+
+
+# Redis as a Distributed Cache (Part 2)
+
+## Goal
+
+Understand how Redis is used in production systems, how caches stay consistent with the database, and how real-world Redis failures are handled.
+
+---
+
+# 17. Cache Invalidation — The Hardest Problem
+
+Keeping cache synchronized with the database is one of the hardest problems in distributed systems.
+
+Example:
+
+Product price changes.
+
+```sql
+UPDATE products
+SET price = 55
+WHERE product_id = 101;
+```
+
+Redis still has:
+
+```json
+{"price":52}
+```
+
+Users now see stale data.
+
+---
+
+# 18. Cache-Aside Write Flow (Production Standard)
+
+Most production systems use **Cache-Aside**.
+
+### Read
+
+1. Check Redis.
+2. If miss → Read DB.
+3. Save in Redis.
+
+### Write
+
+1. Update database.
+2. Delete cache entry.
+3. Next read repopulates Redis.
+
+### Why Delete Instead of Updating Redis?
+
+Because the database is the **source of truth**.
+
+Deleting avoids stale or partially updated cache entries.
+
+> **Production Best Practice:** Update DB first, then invalidate the cache.
+
+---
+
+# 19. Why Not Update Redis First?
+
+Wrong order:
+
+1. Update Redis.
+2. Database update fails.
+
+Now Redis contains incorrect data.
+
+Always commit the database first.
+
+---
+
+# 20. Real World Problem — Cache Stampede
+
+Suppose `product:101` expires.
+
+100,000 users request it simultaneously.
+
+Result:
+
+- Redis MISS for everyone.
+- Every request queries MySQL.
+- Database gets overloaded.
+
+This is called **Cache Stampede**.
+
+### Production Solutions
+
+| Solution | Idea |
+|----------|------|
+| Single Flight | Only one request loads DB. Others wait. |
+| Distributed Lock | First request acquires Redis lock. |
+| Stale-While-Revalidate | Serve slightly stale cache while refreshing. |
+
+Large companies commonly use request coalescing or distributed locking.
+
+---
+
+# 21. Real World Problem — Cache Avalanche
+
+Millions of keys have TTL = 1 hour.
+
+Exactly after one hour:
+
+- Millions of keys expire.
+- Massive traffic hits MySQL.
+
+### Solution
+
+Use **TTL Jitter**.
+
+Instead of:
+
+```
+TTL = 3600 seconds
+```
+
+Use:
+
+```
+TTL = 3600 ± random(0-300)
+```
+
+Keys expire gradually instead of simultaneously.
+
+This is standard production practice.
+
+---
+
+# 22. Real World Problem — Cache Penetration
+
+Users request data that doesn't exist.
+
+Example:
+
+```
+product:999999999
+```
+
+Redis miss.
+
+Database miss.
+
+Every request still reaches the database.
+
+### Solutions
+
+#### Null Caching
+
+Store:
+
+```
+product:999999999 -> NULL
+TTL = 5 minutes
+```
+
+Future requests stop at Redis.
+
+#### Bloom Filter
+
+Maintain a probabilistic structure.
+
+If Bloom Filter says key definitely doesn't exist:
+
+- Skip Redis.
+- Skip Database.
+
+Useful for extremely high traffic systems.
+
+---
+
+# 23. Real World Problem — Redis Memory Full
+
+Redis stores data in RAM.
+
+RAM eventually fills.
+
+### Eviction Policies
+
+| Policy | Meaning |
+|--------|---------|
+| `allkeys-lru` | Remove least recently used key. |
+| `allkeys-lfu` | Remove least frequently used key. |
+| `volatile-lru` | Remove only keys with TTL. |
+| `noeviction` | Reject new writes when memory is full. |
+
+### Production Best Practice
+
+- Session cache → TTL + LRU/LFU.
+- Product cache → LFU is commonly preferred.
+
+---
+
+# 24. Real World Problem — Redis Crash
+
+Redis stores data in RAM.
+
+If Redis crashes:
+
+- Cache disappears.
+- Sessions disappear (if Redis stores sessions).
+
+### Does the Application Stop?
+
+No.
+
+Typical behavior:
+
+1. Redis unavailable.
+2. Backend queries MySQL.
+3. Higher latency.
+4. Redis recovers.
+5. Cache is gradually rebuilt.
+
+This is called **Cache Warm-Up**.
+
+Applications should continue working without Redis.
+
+---
+
+# 25. Cache Warm-Up
+
+Cold Redis means every key is missing.
+
+### Production Strategies
+
+- Lazy loading (Cache-Aside).
+- Preload popular products during deployment.
+- Background warm-up jobs.
+
+Blinkit/Uber commonly warm popular catalog data after deployments.
+
+---
+
+# 26. Redis Persistence — Isn't Redis Only in RAM?
+
+Redis is primarily in-memory but can persist data to SSD.
+
+Two mechanisms:
+
+| Mechanism | Purpose |
+|-----------|---------|
+| RDB | Point-in-time snapshots. |
+| AOF | Append every write command to a log. |
+
+This reduces data loss after crashes.
+
+---
+
+# 27. RDB vs AOF
+
+| RDB | AOF |
+|-----|-----|
+| Periodic snapshot. | Every write appended to log. |
+| Faster restart. | Better durability. |
+| Smaller file. | Larger file. |
+| May lose recent writes. | Usually loses very little data. |
+
+### Production Practice
+
+Many deployments enable **both**.
+
+- RDB for faster recovery.
+- AOF for durability.
+
+---
+
+# 28. Redis Replication
+
+A single Redis server becomes a SPOF.
+
+### Production Architecture
+
+```text
+Backend Servers
+        │
+        ▼
+Redis Primary
+   │
+   ▼
+Redis Replica 1
+Redis Replica 2
+```
+
+Primary handles writes.
+
+Replicas synchronize automatically.
+
+---
+
+# 29. What Happens If Redis Primary Fails?
+
+Production uses **Redis Sentinel** or **Redis Cluster**.
+
+Sentinel:
+
+- Detects failure.
+- Promotes a replica.
+- Clients reconnect automatically.
+
+This provides automatic failover.
+
+---
+
+# 30. Redis Cluster
+
+Large datasets may not fit into one machine.
+
+Redis Cluster partitions keys across multiple Redis nodes.
+
+Example:
+
+| Key Range | Node |
+|-----------|------|
+| Product keys | Node A |
+| Session keys | Node B |
+| Cart keys | Node C |
+
+This is horizontal scaling for Redis itself.
+
+---
+
+# 31. Redis Connection Pool
+
+Backends do **not** open one TCP connection per request.
+
+Each server maintains a Redis connection pool.
+
+Benefits:
+
+- Reuse TCP connections.
+- Lower latency.
+- Higher throughput.
+
+Exactly the same idea as the database connection pool.
+
+---
+
+# 32. Redis Pipelining
+
+Instead of sending commands one by one:
+
+```
+GET key1
+GET key2
+GET key3
+```
+
+Send them together.
+
+Redis processes them without waiting for every response.
+
+Reduces network round trips.
+
+Production systems use pipelining heavily for batch reads.
+
+---
+
+# 33. Common Redis Use Cases
+
+| Use Case | Redis Data Type |
+|----------|-----------------|
+| User Session | String / Hash |
+| OTP | String + TTL |
+| Shopping Cart | Hash |
+| Rate Limiter | String + TTL / Sorted Set |
+| Leaderboard | Sorted Set |
+| Nearby Partners | GEO / Sorted Set |
+| API Response Cache | String |
+| Feature Flags | Hash |
+
+---
+
+# 34. Production Best Practices
+
+- Use **Cache-Aside** for most application caches.
+- Always update the **database first**, then invalidate Redis.
+- Add **TTL jitter** to avoid cache avalanches.
+- Protect hot keys using **single-flight** or distributed locks.
+- Cache negative lookups (NULL caching) for a short time.
+- Use **Redis replication** for high availability.
+- Use **connection pooling** and **pipelining** for high throughput.
+- Design the application so it can continue working if Redis is temporarily unavailable.
+
+---
+
+# 35. Interview Takeaways
+
+- Cache invalidation is solved using Cache-Aside in most production systems.
+- Cache stampedes are prevented using request coalescing or distributed locking.
+- Cache avalanches are mitigated using randomized TTLs.
+- Cache penetration is mitigated using Bloom Filters or null caching.
+- Redis is primarily in-memory but uses RDB and AOF for persistence.
+- Redis replication and Sentinel/Cluster provide high availability in production.
