@@ -284,6 +284,20 @@ Example:
 | Login API | Thread-2 |
 | Payment API | Thread-3 |
 
+
+## Can One Endpoint Be Executed by Multiple Threads?
+
+Yes. The same endpoint can be executed concurrently by multiple threads.
+
+Example:
+
+- User A calls `/payment` → Thread-1 executes it.
+- User B calls `/payment` → Thread-2 executes the same endpoint.
+- User C calls `/payment` → Thread-3 executes the same endpoint.
+
+The application code is shared by all threads; only their execution state is different.
+
+
 Multiple requests execute concurrently using different threads.
 
 ---
@@ -320,6 +334,20 @@ Spring Boot Process
 ├── Thread-2 → Private Stack
 └── Thread-3 → Private Stack
 ```
+
+
+## Where Does Thread-Specific Data Live?
+
+Thread-specific data is stored in the thread's **private stack**.
+
+Examples include:
+
+- Local variables.
+- Method parameters.
+- Function call stack.
+- Current execution state.
+
+Objects created with `new` are allocated on the shared **heap**, but local references to those objects are stored on the thread's stack.
 
 > **Interview takeaway:** Multiple threads execute the same application code concurrently, sharing the process's heap while maintaining independent stacks for their execution state.
 
