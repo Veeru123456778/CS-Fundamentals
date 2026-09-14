@@ -292,6 +292,11 @@ Now T2 sees:
 
 Each query gets a fresh committed snapshot.
 
+> **Important:** The behavior depends on the isolation level.
+>
+> - **READ COMMITTED:** Every query gets a fresh committed snapshot, so the second `SELECT` returns `9`.
+> - **REPEATABLE READ (MySQL default):** The transaction keeps one consistent snapshot from its first read, so the second `SELECT` still returns `10`.
+
 ---
 
 # 11. Summary So Far
