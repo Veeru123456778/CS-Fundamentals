@@ -371,6 +371,41 @@ Its two responsibilities are:
 
 > **Important:** Undo Log is **not** a list of SQL queries. It stores the previous values (or enough metadata to reconstruct them).
 
+Before every UPDATE/DELETE transaction modifies a row, MySQL writes the previous version into the Undo Log. This creates a version chain of the row.
+
+✅ If a transaction's snapshot needs an older committed version, MySQL walks this undo chain until it finds the version visible to that snapshot.
+
+
+### Example: Undo Version Chain
+
+Suppose the row is updated multiple times.
+
+| Version Chain | Value |
+|----------------|-------|
+| **Current Row (latest version)** | **7** |
+| Undo Version 1 (previous committed version) | **8** |
+| Undo Version 2 (older committed version) | **9** |
+| Undo Version 3 (oldest committed version) | **10** |
+
+### How MVCC Uses It
+
+If a transaction started when the committed value was **9**, MySQL follows the undo chain:
+
+```text
+Current Row (7)
+      │
+      ▼
+Undo Version 1 (8)
+      │
+      ▼
+Undo Version 2 (9)   ← Snapshot-visible version
+      │
+      ▼
+Undo Version 3 (10)
+```
+
+The transaction receives **9**, even though the current row has already been updated to **7**.
+
 ---
 
 # 17. What Exactly is Stored in the Undo Log?
