@@ -304,6 +304,29 @@ The bottleneck determines the scaling strategy.
 
 ---
 
+## What Happens Before a Thread Gets Assigned?
+
+Incoming requests first arrive at the web server (Nginx/application server). If all worker threads are busy, requests are placed in a **request queue**.
+
+- If a thread becomes free, the next request is picked from the queue.
+- If the queue becomes full or the request waits too long, it times out or is rejected.
+
+---
+
+
+## Why Not Create Unlimited Threads?
+
+Creating more threads does not increase CPU capacity.
+
+- Every thread consumes memory (its stack).
+- Too many threads increase context-switching overhead.
+- After a certain point, throughput decreases instead of increasing.
+
+The thread pool size should roughly match the server's workload and CPU capacity.
+
+
+---
+
 # 12. Vertical Scaling
 
 Vertical scaling means **making the same server bigger**.
