@@ -618,6 +618,112 @@ This is the transition from **stateful servers** to **stateless distributed serv
 
 ---
 
+
+---
+
+# 32. Cookie vs Session vs JWT
+
+These three terms are often confused because they work together but have different responsibilities.
+
+| Concept | Stored Where? | Purpose |
+|----------|---------------|---------|
+| **Cookie** | Browser | Stores a small value sent automatically with requests (Session ID or JWT). |
+| **Session** | Backend Server / Redis | Stores user-specific state such as login information. |
+| **JWT** | Browser (Cookie or Local Storage) | Stores signed authentication information inside the token itself. |
+
+## How They Work Together
+
+### Session-Based Authentication
+
+1. User logs in.
+2. Server creates a session in Redis or server memory.
+3. Server sends a **Session ID** inside a cookie.
+4. Browser automatically sends the cookie with every request.
+5. Backend uses the Session ID to fetch the session.
+
+### JWT-Based Authentication
+
+1. User logs in.
+2. Server creates a signed JWT.
+3. Browser stores the JWT (Cookie or Local Storage).
+4. Browser sends the JWT with every request.
+5. Backend verifies the JWT signature.
+
+> **Important:** A cookie is only a transport/storage mechanism. It may contain a Session ID or a JWT.
+
+---
+
+# 33. Access Token vs Refresh Token
+
+Production systems usually use **two tokens** instead of one.
+
+## Access Token
+
+- Short-lived JWT (typically 15–30 minutes).
+- Sent with every API request.
+- Contains user identity and permissions.
+- Backend verifies it without querying the database.
+
+## Refresh Token
+
+- Long-lived token (days or weeks).
+- Used only to obtain a new Access Token after it expires.
+- Usually stored securely in Redis or a database.
+
+### Authentication Flow
+
+1. User logs in.
+2. Backend returns **Access Token + Refresh Token**.
+3. APIs use the Access Token.
+4. When it expires, the client sends the Refresh Token.
+5. Backend verifies the Refresh Token and issues a new Access Token.
+
+### Why Use Two Tokens?
+
+| Access Token | Refresh Token |
+|---------------|---------------|
+| Short lifetime reduces security risk. | Allows users to stay logged in without entering credentials again. |
+| Used frequently. | Used rarely. |
+
+---
+
+# 34. Logout in Session-Based Authentication vs JWT
+
+Logout behaves differently depending on the authentication mechanism.
+
+## Session-Based Logout
+
+```text
+Session ID -> User Session (Redis)
+```
+
+Logout simply deletes the session.
+
+Result:
+
+- Session ID becomes invalid.
+- User is logged out immediately from all servers.
+
+## JWT Logout
+
+JWT is stateless.
+
+The backend does not store every access token.
+
+Common production approaches:
+
+- Delete or revoke the **Refresh Token**.
+- Let the Access Token expire naturally.
+- Optionally maintain a temporary blacklist for revoked tokens.
+
+### Comparison
+
+| Session Authentication | JWT Authentication |
+|------------------------|--------------------|
+| Delete session from Redis/server memory. | Revoke refresh token or blacklist JWT. |
+| Immediate logout. | Access token remains valid until expiry unless blacklisted. |
+
+
 # Interview Takeaways
 
 - Sticky Sessions keep users on one backend server but reduce flexibility and failover.
@@ -625,3 +731,4 @@ This is the transition from **stateful servers** to **stateless distributed serv
 - JWT stores authentication state inside a signed client token, making backend servers stateless.
 - Stateless services are easier to scale horizontally because any server can handle any request.
 - Large production systems commonly use a hybrid approach: JWT for authentication and Redis for refresh tokens or session management.
+-  Production systems commonly use short-lived Access Tokens and revocable Refresh Tokens to achieve both stateless authentication and secure logout.
