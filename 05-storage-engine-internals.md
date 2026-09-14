@@ -371,6 +371,8 @@ Its two responsibilities are:
 
 > **Important:** Undo Log is **not** a list of SQL queries. It stores the previous values (or enough metadata to reconstruct them).
 
+✅ The current uncommitted version lives in the row itself (in the Buffer Pool/table page), along with transaction metadata (trx_id and a pointer to the undo record).
+
 Before every UPDATE/DELETE transaction modifies a row, MySQL writes the previous version into the Undo Log. This creates a version chain of the row.
 
 ✅ If a transaction's snapshot needs an older committed version, MySQL walks this undo chain until it finds the version visible to that snapshot.
