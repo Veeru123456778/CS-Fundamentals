@@ -82,6 +82,25 @@ The process contains:
 |------------|-----|
 | Stores application permanently. | Stores the running application temporarily. |
 
+
+What actually happens
+
+Program starts: The OS loads the executable/JAR and the essential parts needed to start the process into RAM.
+
+On demand: As execution reaches different classes/functions, the OS (and JVM for Java) loads the required code pages into RAM. This is called demand paging.
+
+Frequently used code stays cached in RAM; unused code may never be loaded.
+
+Spring Boot example
+
+Your application has 5,000 classes.
+
+Startup loads the classes needed for bootstrapping (Spring context, Tomcat, etc.).
+
+If /payment API is never called, many payment-related classes may not be loaded until that code path is executed.
+
+Interview takeaway: The executable resides on SSD, while the OS/JVM loads code into RAM lazily (on demand) using virtual memory and demand paging, not all at once.
+
 ---
 
 # 4. What is a Process?
