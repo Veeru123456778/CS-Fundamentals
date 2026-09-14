@@ -104,7 +104,8 @@ A common misconception is that **the entire application is loaded into RAM when 
 Suppose the application contains 5,000 classes.
 
 - During startup, Spring Boot loads the classes required to initialize the application context and embedded Tomcat.
-- If the `/payment` API is never called, many payment-related classes may remain unloaded until that endpoint is accessed.
+- If no user (or another service) ever calls the `/payment` API, many payment-related classes may remain unloaded until that endpoint is accessed for the first time.
+
 
 ### Key Takeaways
 
