@@ -83,23 +83,34 @@ The process contains:
 | Stores application permanently. | Stores the running application temporarily. |
 
 
-What actually happens
+## How Does the Backend Code Get Loaded into RAM?
 
-Program starts: The OS loads the executable/JAR and the essential parts needed to start the process into RAM.
+A common misconception is that **the entire application is loaded into RAM when the server starts**. In reality, code is loaded **on demand**.
 
-On demand: As execution reaches different classes/functions, the OS (and JVM for Java) loads the required code pages into RAM. This is called demand paging.
+### How it Works
 
-Frequently used code stays cached in RAM; unused code may never be loaded.
+1. **Application stored on SSD/HDD**
+   - The compiled application (`.jar`, Go binary, Node.js files, etc.) lives permanently on disk.
 
-Spring Boot example
+2. **Process starts**
+   - When the application starts, the operating system creates a process and loads only the essential executable code and required libraries into RAM.
 
-Your application has 5,000 classes.
+3. **Demand Paging (On-Demand Loading)**
+   - As execution reaches different classes/functions/modules, the OS (and the JVM in Java) loads the required code pages into RAM.
+   - Code that is never executed may never be loaded into RAM.
 
-Startup loads the classes needed for bootstrapping (Spring context, Tomcat, etc.).
+### Spring Boot Example
 
-If /payment API is never called, many payment-related classes may not be loaded until that code path is executed.
+Suppose the application contains 5,000 classes.
 
-Interview takeaway: The executable resides on SSD, while the OS/JVM loads code into RAM lazily (on demand) using virtual memory and demand paging, not all at once.
+- During startup, Spring Boot loads the classes required to initialize the application context and embedded Tomcat.
+- If the `/payment` API is never called, many payment-related classes may remain unloaded until that endpoint is accessed.
+
+### Key Takeaways
+
+- **SSD/HDD:** Stores the application permanently.
+- **RAM:** Stores only the code and data currently needed by the running process.
+- **Loading Strategy:** The operating system uses **demand paging** to load code into RAM lazily, which reduces memory usage and improves startup efficiency.
 
 ---
 
