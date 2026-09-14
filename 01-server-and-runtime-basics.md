@@ -6,6 +6,8 @@ Understand what a server actually is, how a backend application runs on it, how 
 
 This is the foundation before learning distributed systems.
 
+> **Technology Agnostic Note:** Although examples in these notes use **Spring Boot (Java)**, the concepts discussed here—servers, processes, threads/concurrency, networking, databases, Redis, transactions, and distributed systems—are **technology agnostic** and apply equally to backend services built with Go, Node.js, Python, .NET, Rust, or any other server-side framework. Only the application runtime and concurrency model differ.
+
 ---
 
 # 1. What is a Server?
