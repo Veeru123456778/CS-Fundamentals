@@ -307,7 +307,7 @@ This is called a **Back-to-Table Lookup** (Bookmark Lookup).
 
 ---
 
-# 14. Covering Index
+# 14. Covering Index (If we want value of primary key itself)
 
 Suppose query:
 
