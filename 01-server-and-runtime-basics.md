@@ -288,6 +288,45 @@ Multiple requests execute concurrently using different threads.
 
 ---
 
+
+## Process vs Threads Memory Model
+
+A backend application runs as **one process**, and multiple threads execute requests inside that process.
+
+### What is Shared vs Private?
+
+| Memory Area | Shared Across Threads? | Purpose |
+|-------------|-------------------------|---------|
+| **Application Code** | ✅ Yes | All threads execute the same application code. |
+| **Heap Memory** | ✅ Yes | Stores shared objects like Spring Beans, caches, connection pools, and other application objects. |
+| **Thread Stack** | ❌ No | Stores local variables, method parameters, return addresses, and function call stack for one thread. |
+| **Program Counter** | ❌ No | Keeps track of the current instruction being executed by that thread. |
+
+### Why is Heap Shared?
+
+The heap stores objects that the entire application can access and reuse, such as singleton Spring beans, caches, and database connection pools.
+
+Thread-specific data **does not live in the heap**. Each thread has its own private **stack**, which stores its local variables and execution state independently of other threads.
+
+### Mental Model
+
+```text
+Spring Boot Process
+│
+├── Shared Code
+├── Shared Heap (Beans, Cache, Connection Pool, Objects)
+│
+├── Thread-1 → Private Stack
+├── Thread-2 → Private Stack
+└── Thread-3 → Private Stack
+```
+
+> **Interview takeaway:** Multiple threads execute the same application code concurrently, sharing the process's heap while maintaining independent stacks for their execution state.
+
+
+---
+
+
 # 12. CPU Cores vs Threads
 
 Threads are scheduled by the operating system.
