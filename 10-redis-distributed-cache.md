@@ -451,13 +451,204 @@ Result:
 
 This is called **Cache Stampede**.
 
-### Production Solutions
+# Cache Stampede — Deep Dive
 
-| Solution | Idea |
-|----------|------|
-| Single Flight | Only one request loads DB. Others wait. |
-| Distributed Lock | First request acquires Redis lock. |
-| Stale-While-Revalidate | Serve slightly stale cache while refreshing. |
+## Problem
+
+Suppose `product:101` is one of the hottest products.
+
+It has a TTL of **1 hour**.
+
+At exactly 6:00 PM the cache expires.
+
+Suddenly **100,000 users** request the same product.
+
+### Without Protection
+
+```text
+Redis
+   │
+   ├── MISS
+   ├── MISS
+   ├── MISS
+   ├── MISS
+   └── MISS (100,000 times)
+
+All requests hit MySQL simultaneously.
+```
+
+Result:
+
+- Redis has no value.
+- Every request queries MySQL.
+- Database gets overloaded.
+- Response latency increases dramatically.
+
+This is called a **Cache Stampede**.
+
+---
+
+## Solution 1 — Single Flight / Request Coalescing (Most Common)
+
+Idea:
+
+> Only **one request** is allowed to fetch data from MySQL. Every other request waits for that result.
+
+### Step-by-Step
+
+1. 100,000 requests arrive.
+2. Request **R1** notices cache miss.
+3. R1 starts fetching from MySQL.
+4. Requests **R2...R100000** do **not** query MySQL.
+5. They wait for R1.
+6. R1 stores data in Redis.
+7. Waiting requests read the newly cached value.
+
+### Flow
+
+```text
+100,000 Requests
+       │
+       ▼
+Redis MISS
+       │
+       ▼
+Request R1 → MySQL
+       │
+       ▼
+Store value in Redis
+       │
+       ▼
+All waiting requests read Redis
+```
+
+### Why It's Good
+
+- Only **one database query**.
+- Database load stays low.
+- Very common in backend services.
+
+> **Production Practice:** Many companies implement request coalescing inside the application process.
+
+---
+
+## Solution 2 — Distributed Lock (Works Across Multiple Servers)
+
+Single Flight works well inside one server.
+
+But what if we have **10 backend servers**?
+
+Each server receives cache misses.
+
+Without coordination:
+
+- Server A queries MySQL.
+- Server B queries MySQL.
+- Server C queries MySQL.
+
+Still multiple DB queries.
+
+### Solution
+
+Use Redis itself as a lock.
+
+### Step-by-Step
+
+1. Cache miss occurs.
+2. Server A acquires lock `lock:product:101`.
+3. Server B tries to acquire the lock → fails.
+4. Server C tries → fails.
+5. Server A queries MySQL.
+6. Server A updates Redis.
+7. Server A releases the lock.
+8. Other servers read Redis.
+
+### Flow
+
+```text
+Server A ── Acquires Lock ──► MySQL
+Server B ── Waits
+Server C ── Waits
+
+After cache is filled:
+
+Server B → Redis
+Server C → Redis
+```
+
+### Why It's Needed
+
+The lock is **shared across all servers**, so only one machine rebuilds the cache.
+
+> **Production Practice:** Redis distributed locks are commonly used for rebuilding expensive cache entries.
+
+---
+
+## Solution 3 — Stale-While-Revalidate (Best User Experience)
+
+Idea:
+
+> Serve slightly old data immediately while refreshing the cache in the background.
+
+### Example
+
+Cached product price:
+
+```
+₹52
+```
+
+TTL expires.
+
+Instead of making users wait:
+
+1. User receives cached value `₹52`.
+2. Background worker fetches fresh value `₹55`.
+3. Redis is updated.
+4. Next user receives `₹55`.
+
+### Flow
+
+```text
+Redis has expired value
+        │
+        ├── Return stale value immediately
+        │
+        ▼
+Background refresh from MySQL
+        │
+        ▼
+Update Redis
+```
+
+### Why It's Good
+
+- Very low latency.
+- No request waits.
+- Excellent for product catalogs, restaurant menus, news feeds, etc.
+
+### Trade-off
+
+Users may see **slightly stale data** for a few seconds.
+
+---
+
+# Which Solution Do Big Companies Use?
+
+| Situation | Preferred Solution |
+|-----------|--------------------|
+| Hot cache key inside one server | **Single Flight / Request Coalescing** |
+| Hot cache key across many backend servers | **Redis Distributed Lock** |
+| Data can tolerate a few seconds of staleness | **Stale-While-Revalidate** |
+| Extremely hot product/catalog APIs | Often **Stale-While-Revalidate + Single Flight** together. |
+
+### Interview Takeaway
+
+Cache stampede means **many requests rebuild the same cache simultaneously**.
+
+Production systems prevent it by ensuring **only one request rebuilds the cache**, or by **serving stale data while refreshing it in the background**.
+
+
 
 Large companies commonly use request coalescing or distributed locking.
 
