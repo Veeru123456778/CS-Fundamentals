@@ -312,3 +312,375 @@ Each query gets a fresh committed snapshot.
 | Read Committed | Prevents dirty reads by exposing only committed versions. |
 
 
+
+---
+
+# 12. Non-Repeatable Read
+
+## Definition
+
+A **Non-Repeatable Read** happens when a transaction reads the same row twice and gets **different committed values**.
+
+### Example
+
+Initial stock:
+
+| product_id | stock |
+|------------|-------|
+| 101 | **10** |
+
+### READ COMMITTED Behavior
+
+| Transaction T1 | Transaction T2 |
+|----------------|----------------|
+| `BEGIN` | `BEGIN` |
+| Read stock → **10** | |
+| | Update stock → **9** |
+| | `COMMIT` |
+| Read stock again → **9** | |
+
+The same transaction (`T1`) read **10** first and **9** later.
+
+This is a **Non-Repeatable Read**.
+
+---
+
+# 13. Why Is Non-Repeatable Read a Problem?
+
+Suppose an order placement transaction:
+
+1. Reads inventory = 10.
+2. Performs validation.
+3. Reads inventory again before placing the order.
+
+If another transaction changes the inventory in between, the transaction observes different values while executing the same business logic.
+
+Sometimes business logic requires a **consistent view** throughout the transaction.
+
+---
+
+# 14. Repeatable Read (MySQL Default)
+
+**Repeatable Read** prevents non-repeatable reads.
+
+Instead of giving every query a fresh snapshot, the database gives the transaction **one consistent snapshot**.
+
+### Example
+
+Initial stock:
+
+| product_id | stock |
+|------------|-------|
+| 101 | **10** |
+
+### Repeatable Read Behavior
+
+| Transaction T1 | Transaction T2 |
+|----------------|----------------|
+| `BEGIN` | |
+| Read stock → **10** | |
+| | `BEGIN` |
+| | Update stock → **9** |
+| | `COMMIT` |
+| Read stock again → **10** | |
+
+Even after T2 commits, T1 continues reading **10**.
+
+---
+
+# 15. What is a Snapshot?
+
+A **snapshot** is the committed view of the database visible to a transaction.
+
+### Important Rule
+
+The snapshot is created when the transaction performs its **first consistent read**.
+
+Everything committed before that snapshot is visible.
+
+Everything committed after that snapshot is invisible for normal reads.
+
+### Snapshot Timeline
+
+Initial committed value:
+
+```text
+Stock = 10
+```
+
+T1 starts transaction and performs first read.
+
+Snapshot contains:
+
+```text
+Stock = 10
+```
+
+Later T2 commits:
+
+```text
+Stock = 9
+```
+
+Snapshot inside T1 **does not change**.
+
+---
+
+# 16. Read Your Own Writes Still Works
+
+Snapshots do not hide a transaction's own updates.
+
+Example:
+
+```sql
+BEGIN;
+
+SELECT stock;      -- 10
+
+UPDATE inventory
+SET stock = 9
+WHERE product_id = 101;
+
+SELECT stock;      -- 9
+```
+
+Behavior:
+
+- Snapshot says committed value is 10.
+- Transaction's own update overrides the snapshot.
+- Transaction reads 9.
+
+### Rule
+
+A transaction always sees:
+
+1. Its own latest writes.
+2. Otherwise, the snapshot version.
+
+---
+
+# 17. Read Committed vs Repeatable Read
+
+| Behavior | READ COMMITTED | REPEATABLE READ |
+|----------|----------------|-----------------|
+| Dirty Reads | ❌ Prevented | ❌ Prevented |
+| Snapshot Lifetime | Per Query | Per Transaction |
+| Latest Committed Value | Every Query | Only First Snapshot |
+| Non-Repeatable Reads | Possible | Prevented |
+
+This is the biggest difference between the two isolation levels.
+
+---
+
+# 18. Phantom Read
+
+## Definition
+
+A phantom read happens when **new rows appear or disappear** within the same transaction.
+
+Unlike non-repeatable reads, this is **not an update to an existing row**.
+
+It is a change in the **set of rows returned**.
+
+### Example
+
+Orders table:
+
+| amount |
+|--------|
+| 100 |
+| 200 |
+
+Transaction T1:
+
+```sql
+BEGIN;
+
+SELECT *
+FROM orders
+WHERE amount > 50;
+```
+
+Returns **2 rows**.
+
+Transaction T2:
+
+```sql
+INSERT INTO orders(amount)
+VALUES (150);
+
+COMMIT;
+```
+
+Now T1 executes the same query again.
+
+```sql
+SELECT *
+FROM orders
+WHERE amount > 50;
+```
+
+Returns **3 rows**.
+
+A new row appeared.
+
+This is a **Phantom Read**.
+
+---
+
+# 19. Why Phantom Reads Matter
+
+Imagine calculating today's sales.
+
+Transaction reads all today's orders.
+
+Another transaction inserts a new order during the calculation.
+
+The report changes midway through execution.
+
+Sometimes this is undesirable.
+
+---
+
+# 20. Gap Locks
+
+Gap Locks are MySQL's mechanism for preventing phantom reads.
+
+Instead of locking only existing rows, the database locks the **gap between index values**.
+
+### Example
+
+Existing IDs:
+
+| order_id |
+|----------|
+| 100 |
+| 110 |
+| 130 |
+
+Transaction T1:
+
+```sql
+SELECT *
+FROM orders
+WHERE order_id BETWEEN 110 AND 130
+FOR UPDATE;
+```
+
+Database locks:
+
+- Row 110.
+- Row 130.
+- Gap between them.
+
+Now T2 cannot insert:
+
+```sql
+INSERT INTO orders(order_id=120);
+```
+
+The insert waits.
+
+---
+
+# 21. Next-Key Lock
+
+A **Next-Key Lock** combines:
+
+- Row Lock.
+- Gap Lock.
+
+It locks both:
+
+- Existing row.
+- Gap before the next index value.
+
+This is the default locking behavior for locking reads in MySQL's `REPEATABLE READ`.
+
+---
+
+# 22. When Are Gap Locks Used?
+
+Gap locks are **not** used for ordinary `SELECT`.
+
+They are used for **locking reads**, such as:
+
+```sql
+SELECT ...
+FOR UPDATE;
+
+SELECT ...
+FOR SHARE;
+```
+
+under `REPEATABLE READ`.
+
+Normal MVCC reads do not acquire gap locks.
+
+---
+
+# 23. Serializable Isolation Level
+
+This is the strongest isolation level.
+
+Behavior:
+
+- Transactions execute as if they ran one after another.
+- Readers may block writers.
+- Writers may block readers.
+
+Provides maximum correctness but lowest concurrency.
+
+---
+
+# 24. Isolation Levels Summary
+
+| Isolation Level | Dirty Read | Non-Repeatable Read | Phantom Read |
+|-----------------|-----------|---------------------|--------------|
+| Read Uncommitted | ✅ Possible | ✅ Possible | ✅ Possible |
+| Read Committed | ❌ Prevented | ✅ Possible | ✅ Possible |
+| Repeatable Read (MySQL) | ❌ Prevented | ❌ Prevented | ❌ Prevented (using MVCC + Gap Locks) |
+| Serializable | ❌ Prevented | ❌ Prevented | ❌ Prevented |
+
+---
+
+# 25. MVCC vs Locks
+
+MVCC handles **ordinary reads**.
+
+Locks handle **protected reads and writes**.
+
+### Use MVCC
+
+```sql
+SELECT * FROM products;
+```
+
+- No row lock.
+- Reads snapshot.
+
+### Use Locks
+
+```sql
+SELECT * FROM products
+FOR UPDATE;
+```
+
+- Exclusive lock acquired.
+- Prevents concurrent modifications.
+
+Use locking reads only when business logic requires protecting rows.
+
+---
+
+# Interview Takeaways
+
+- MVCC keeps multiple versions of rows temporarily.
+- Every transaction sees a consistent snapshot under `REPEATABLE READ`.
+- A transaction always sees its own uncommitted writes.
+- `READ COMMITTED` creates a new snapshot for every query.
+- `REPEATABLE READ` keeps one snapshot for the entire transaction.
+- Phantom reads involve changes in the result set, not updates to existing rows.
+- Gap Locks prevent inserts into an index range.
+- Next-Key Locks combine row locks and gap locks to prevent phantom reads.
+- MVCC improves concurrency because normal reads usually do not block writes.
