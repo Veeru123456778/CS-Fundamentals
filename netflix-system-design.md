@@ -981,6 +981,11 @@ Example:
 
 The metadata stores this ordered list.
 
+
+- master.mov metadata stores: object information and an ordered list of internal block IDs (storage locations). It usually does not directly store physical node IDs; S3's internal metadata service resolves which nodes currently hold each block.
+
+- Replication / Erasure Coding info: Yes, S3 internally maintains this mapping, but it's part of the storage system's metadata, not the user-visible master.mov object metadata. It tracks replicas/parity locations for durability and recovery
+
 ---
 
 ## How `GET master.mov` Works
