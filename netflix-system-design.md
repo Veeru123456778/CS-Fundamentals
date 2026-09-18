@@ -100,7 +100,7 @@ These deserve their own chapter:
 
 Understand **exactly** how Netflix uploads a 200 GB master video from a production house into its storage system.
 
-This chapter covers only the upload process — no transcoding or streaming yet.
+This chapter covers only the upload pipeline — from creating an upload session until the final master video is stored in Object Storage.
 
 ---
 
@@ -108,17 +108,18 @@ This chapter covers only the upload process — no transcoding or streaming yet.
 
 > A production house wants to upload a 200 GB movie to Netflix reliably, even if the network fails midway.
 
-### Non-Functional Requirements
+## Non-Functional Requirements
 
-- Support files of hundreds of GBs or even TBs.
-- Resume upload after failures.
-- Upload chunks in parallel for high throughput.
-- Verify file integrity.
-- Handle duplicate/retried chunk uploads safely.
+- Upload files of hundreds of GBs or TBs.
+- Resume uploads after failures.
+- Upload multiple chunks in parallel.
+- Verify integrity of every chunk.
+- Prevent duplicate uploads during retries.
+- Keep application servers free from handling 200 GB of traffic.
 
 ---
 
-# Complete Upload Flow
+# High-Level Upload Architecture
 
 ```mermaid
 sequenceDiagram
@@ -130,37 +131,38 @@ sequenceDiagram
     Producer->>IngestionAPI: POST /uploads/start
     IngestionAPI->>DB: Create upload session
     DB-->>IngestionAPI: upload_id
-    IngestionAPI-->>Producer: upload_id + chunk configuration
+    IngestionAPI-->>Producer: upload_id + chunk_size + upload URLs
 
     loop Parallel Chunk Uploads
-        Producer->>ObjectStorage: Upload Chunk (chunk_number)
-        ObjectStorage-->>Producer: ETag / Success
-        Producer->>IngestionAPI: Chunk Uploaded Metadata
-        IngestionAPI->>DB: Mark chunk as uploaded
+        Producer->>ObjectStorage: PUT chunk using upload URL
+        ObjectStorage-->>Producer: 200 OK + ETag
+
+        Producer->>IngestionAPI: POST /uploads/chunks/complete
+        IngestionAPI->>DB: Mark chunk uploaded
     end
 
     Producer->>IngestionAPI: POST /uploads/complete
-    IngestionAPI->>DB: Verify all chunks exist
+
+    IngestionAPI->>DB: Verify all chunks uploaded
     IngestionAPI->>ObjectStorage: Complete Multipart Upload
     ObjectStorage-->>IngestionAPI: Final Object Created
+
     IngestionAPI->>DB: Asset status = READY_FOR_PROCESSING
 ```
 
 ---
 
-# Step 1 — Start Upload Session
+# Step 1 — Create Upload Session
 
-The producer **does not upload the file immediately**.
+Before uploading any bytes, the producer creates an upload session.
 
-First, it requests an upload session.
-
-### API
+## API
 
 ```http
 POST /v1/uploads/start
 ```
 
-### Request
+## Request
 
 ```json
 {
@@ -171,78 +173,80 @@ POST /v1/uploads/start
 }
 ```
 
-### Response
+## Backend Work
+
+The Ingestion Service:
+
+1. Authenticates the production house.
+2. Creates an upload session in the database.
+3. Calculates chunk configuration.
+4. Creates upload URLs for Object Storage.
+
+## Response
 
 ```json
 {
   "upload_id": "upl_9a81f3",
   "chunk_size": 67108864,
   "total_chunks": 3200,
-  "expires_at": "2026-09-20T10:00:00Z"
+  "expires_at": "2026-09-20T10:00:00Z",
+  "upload_urls": [
+    {
+      "chunk_number": 1,
+      "url": "https://storage.netflix.com/upload?...partNumber=1"
+    },
+    {
+      "chunk_number": 2,
+      "url": "https://storage.netflix.com/upload?...partNumber=2"
+    }
+  ]
 }
 ```
 
-### Why create an upload session?
+## Why does the server return Upload URLs?
 
-The upload session becomes the **single source of truth** for this upload.
+The client uploads **directly to Object Storage** instead of sending 200 GB through the Ingestion API.
 
-It stores:
+**Benefit**
 
-- Who is uploading.
-- Which movie.
-- Total file size.
-- Chunk size.
-- Upload status.
-- Progress.
+- API servers handle metadata only.
+- Object Storage handles heavy network traffic.
 
 ---
 
-# Step 2 — How is the 200 GB file split?
+# Step 2 — Client Splits the File into Chunks
 
-The **client application** running at the production house splits the file.
-
-Netflix's server never downloads the entire file first.
+The producer's upload client performs chunking locally.
 
 ## Example
 
-```
-Movie Size = 200 GB
-
-Chunk Size = 64 MB
-
-Total Chunks = 200 GB / 64 MB = 3200 chunks
+```text
+Movie Size  = 200 GB
+Chunk Size  = 64 MB
+Total Chunks = 3200
 ```
 
-### Chunk Layout
+## Chunk Layout
 
-| Chunk Number | Byte Range |
-|--------------|-----------|
+| Chunk | Byte Range |
+|-------|------------|
 | 1 | 0 → 64 MB |
 | 2 | 64 MB → 128 MB |
 | 3 | 128 MB → 192 MB |
 | ... | ... |
-| 3200 | Last remaining bytes |
+| 3200 | Remaining bytes |
 
-### Important
+## Important
 
-The client reads **64 MB at a time from disk**.
+The client reads **64 MB from disk at a time**.
 
-It does **not** load the 200 GB file into RAM.
+It never loads the complete 200 GB file into memory.
 
 ---
 
-# Step 3 — Upload Chunks in Parallel
+# Step 3 — Parallel Chunk Upload
 
-Instead of uploading sequentially:
-
-```
-Chunk1
-Chunk2
-Chunk3
-...
-```
-
-The client uploads multiple chunks simultaneously.
+Instead of uploading sequentially, multiple workers upload chunks simultaneously.
 
 ```text
 Worker 1 → Chunk 1
@@ -253,116 +257,161 @@ Worker 5 → Chunk 5
 ...
 ```
 
-### Why parallel uploads?
+## Why parallel uploads?
 
 - Better bandwidth utilization.
-- Faster upload over high-latency networks.
-- Independent retries.
+- Lower total upload time.
+- Failed chunks don't block successful chunks.
 
-### Typical Parallelism
-
-- 4–32 concurrent uploads depending on bandwidth.
-- Chunk size stays fixed.
+Typical concurrency is **4–32 workers**, depending on available bandwidth.
 
 ---
 
-# Step 4 — Uploading a Chunk
+# Step 4 — Upload a Chunk to Object Storage
 
-Each chunk is uploaded independently.
+The upload client uses the upload URL received earlier.
 
-### API Concept
+## Request
 
 ```http
-PUT /v1/uploads/{upload_id}/chunks/{chunk_number}
+PUT https://storage.netflix.com/upload?...partNumber=15
+
+Body: <64 MB binary data>
 ```
 
-Headers contain:
+## Headers
 
 ```http
-Chunk-Number: 15
 Content-Length: 67108864
 Checksum: sha256(...)
 ```
 
-Body contains only **64 MB of bytes**.
+## Response from Object Storage
 
-### Server receives
+```http
+HTTP/1.1 200 OK
 
-- upload_id
-- chunk_number
-- checksum
-- chunk bytes
+ETag: "9f6203b8a1..."
+```
+
+## What is uploaded?
+
+Only **raw bytes of Chunk 15**.
+
+At this stage there is **no complete movie object**.
 
 ---
 
-# Where is the chunk stored?
+# Step 5 — Notify Netflix That Chunk Upload Succeeded
 
-The chunk is stored **directly in Object Storage**.
+Uploading to Object Storage is **not enough**.
 
-Example logical path:
+The client informs the Ingestion Service after receiving `200 OK`.
 
+## API
+
+```http
+POST /v1/uploads/chunks/complete
 ```
-uploads/upl_9a81f3/part-15
+
+## Request
+
+```json
+{
+  "upload_id": "upl_9a81f3",
+  "chunk_number": 15,
+  "etag": "9f6203b8a1...",
+  "checksum": "sha256(...)"
+}
 ```
 
-At this stage there is **no final movie object yet**.
+## Backend Work
 
-Only temporary chunk objects exist.
+The Ingestion Service:
+
+- Verifies upload session.
+- Stores chunk metadata.
+- Marks chunk as uploaded.
+- Updates upload progress.
+
+This API is **idempotent**.
+
+Calling it multiple times for the same chunk is safe.
 
 ---
 
-# Step 5 — Track Chunk Metadata
+# Step 6 — Where Are Chunks Stored?
 
-Netflix keeps metadata in a database.
+During upload, chunks are temporary objects.
+
+```text
+uploads/
+└── upl_9a81f3/
+    ├── part-1
+    ├── part-2
+    ├── part-3
+    ├── ...
+    └── part-3200
+```
+
+The final movie **does not exist yet**.
+
+Object Storage only stores temporary parts.
+
+---
+
+# Step 7 — Metadata Stored by Netflix
 
 ## upload_sessions Table
 
 | Column | Purpose |
 |--------|---------|
-| upload_id | Unique upload session |
-| producer_id | Who uploaded |
-| file_name | Original file |
-| total_size | 200 GB |
-| chunk_size | 64 MB |
-| total_chunks | 3200 |
-| uploaded_chunks | Counter |
-| status | IN_PROGRESS / COMPLETED |
+| upload_id | Upload session identifier |
+| producer_id | Owner of upload |
+| asset_id | Movie identifier |
+| file_name | Original uploaded file |
+| total_size | File size |
+| chunk_size | Size of each chunk |
+| total_chunks | Expected chunk count |
+| uploaded_chunks | Progress counter |
+| status | CREATED / IN_PROGRESS / COMPLETED / FAILED |
 
 ## upload_chunks Table
 
 | Column | Purpose |
 |--------|---------|
 | upload_id | Session reference |
-| chunk_number | 1…3200 |
-| checksum | SHA256/MD5 |
-| etag | Storage identifier |
-| size | Chunk size |
+| chunk_number | Chunk index |
+| etag | Object Storage ETag |
+| checksum | Client checksum |
+| size | Uploaded size |
 | status | PENDING / UPLOADED |
 
-### Why a separate chunk table?
+## Why two tables?
 
-Because every chunk is tracked independently.
+- `upload_sessions` stores overall upload state.
+- `upload_chunks` tracks every individual chunk.
 
 ---
 
-# Step 6 — How does Netflix know upload progress?
+# Step 8 — Upload Progress
 
-Whenever a chunk succeeds:
+Whenever `/uploads/chunks/complete` succeeds:
 
 ```text
 uploaded_chunks += 1
 ```
 
-Progress becomes
+Progress is calculated as:
 
-```
+```text
 uploaded_chunks / total_chunks
 ```
 
 Example:
 
-| Uploaded | Progress |
-|----------|----------|
+| Uploaded Chunks | Progress |
+|----------------|----------|
 | 800 | 25% |
 | 1600 | 50% |
 | 2400 | 75% |
@@ -372,36 +421,41 @@ The producer dashboard simply reads this metadata.
 
 ---
 
-# Step 7 — What if Chunk 532 fails?
+# Step 9 — Failure Handling
 
-Only that chunk is retried.
+## Case 1 — Chunk Upload Fails
 
 ```text
-Chunk 531 ✅
-Chunk 532 ❌ Retry
-Chunk 533 ✅
-Chunk 534 ✅
+PUT Chunk 532
+      ↓
+Network Error
+      ↓
+Retry PUT Chunk 532
 ```
 
-Nothing else is uploaded again.
-
-### Why?
-
-Each chunk is independent and identified by:
-
-```
-(upload_id, chunk_number)
-```
-
-This makes retries **idempotent**.
-
-Uploading Chunk 532 twice simply replaces or ignores the previous copy.
+No API call is made to Netflix because Object Storage never confirmed success.
 
 ---
 
-# Step 8 — Resume After Network Failure
+## Case 2 — Chunk Upload Succeeds but Notification Fails
 
-Suppose upload stopped at **Chunk 1850**.
+```text
+PUT Chunk 532 → Success ✅
+
+POST /uploads/chunks/complete → Failed ❌
+```
+
+The client retries only:
+
+```http
+POST /uploads/chunks/complete
+```
+
+Since `(upload_id, chunk_number)` is unique, retries are safe.
+
+---
+
+## Case 3 — Resume Upload After Disconnect
 
 Producer reconnects.
 
@@ -415,57 +469,51 @@ GET /v1/uploads/{upload_id}/status
 
 ```json
 {
-  "uploaded_chunks": [
-    1,
-    2,
-    3,
-    ...
-    1850
-  ]
+  "uploaded_chunks": [1,2,3,...,1850]
 }
 ```
 
 The client uploads only:
 
-```
+```text
 1851 → 3200
 ```
 
-No previous chunks are re-uploaded.
+No previously uploaded chunks are sent again.
 
 ---
 
-# Step 9 — Complete Multipart Upload
+# Step 10 — Complete Multipart Upload
 
-After all chunks are uploaded:
+After every chunk is uploaded and recorded:
 
-### API
+## API
 
 ```http
-POST /v1/uploads/{upload_id}/complete
+POST /v1/uploads/complete
 ```
 
-### Backend Validation
+## Backend Validation
 
-1. Are all 3200 chunks present?
-2. Is every checksum valid?
-3. Is total uploaded size exactly 200 GB?
+The Ingestion Service checks:
 
-If yes:
+1. Have all expected chunk records been received?
+2. Does every chunk have an ETag?
+3. Are checksums valid?
+4. Does uploaded size equal original file size?
 
-The ingestion service instructs object storage to **assemble** the chunks.
+Only then is completion allowed.
 
 ---
 
-# What happens inside Object Storage?
+# Step 11 — Object Storage Assembles the Final Movie
 
-Temporary chunks:
+Before completion:
 
 ```text
 uploads/upl_9a81f3/
     part-1
     part-2
-    part-3
     ...
     part-3200
 ```
@@ -473,16 +521,20 @@ uploads/upl_9a81f3/
 After completion:
 
 ```text
-assets/movie_8472/master.mov
+assets/
+└── movie_8472/
+    └── master.mov
 ```
 
-The storage service concatenates chunks **in order** into one immutable object.
+Object Storage combines the parts **in chunk order** into one immutable object.
 
-Temporary parts are deleted afterwards.
+Temporary chunk objects are deleted afterwards.
+
+> We'll study how this assembly works internally in Part 3.
 
 ---
 
-# State Machine
+# Upload Session State Machine
 
 ```mermaid
 stateDiagram-v2
@@ -500,21 +552,23 @@ stateDiagram-v2
 
 | Scenario | Netflix Behavior |
 |----------|------------------|
-| Network disconnect | Resume remaining chunks. |
-| Duplicate chunk upload | Safe because upload is idempotent. |
-| Missing chunk | Completion request fails. |
-| Wrong checksum | Chunk rejected and re-upload requested. |
-| Upload session expired | New upload session required. |
+| Network disconnect during upload | Resume remaining chunks. |
+| Duplicate chunk upload | Safe because chunk completion API is idempotent. |
+| Missing chunk | `/uploads/complete` fails validation. |
+| Invalid checksum | Chunk is rejected and must be re-uploaded. |
+| Upload session expired | Upload URLs become invalid and a new session is required. |
 
 ---
 
 # Key Takeaways
 
-- The **client** splits the 200 GB file into chunks.
-- Chunks are uploaded **directly to object storage** in parallel.
-- Netflix stores upload progress in metadata tables.
-- Retries happen **per chunk**, not for the whole file.
-- The final movie object is created **only after** all chunks are verified.
+- The **client** performs chunking locally.
+- The Ingestion API creates an **upload session** and returns **upload URLs**.
+- Chunks are uploaded **directly to Object Storage**, not through API servers.
+- After every successful upload, the client calls **`/uploads/chunks/complete`** so Netflix records metadata.
+- Failed uploads retry **only the failed chunk**.
+- The final movie object is created only after **`/uploads/complete`** succeeds.
+- At this point, Netflix has one uploaded **master video** ready for processing.
 
 ---
 
@@ -522,10 +576,10 @@ stateDiagram-v2
 
 ## Part 3 — Object Storage Internals
 
-We'll answer:
+We'll deep dive into:
 
-- What exactly is Object Storage (S3/Open Connect storage)?
-- How does multipart assembly happen internally?
-- What is an ETag?
-- How are replicas stored across data centers?
-- Why doesn't Netflix store movies in MySQL or Redis?
+- What exactly Object Storage is.
+- How multipart assembly works internally.
+- ETags and checksum verification.
+- Physical storage, replication, and durability.
+- Why Netflix uses Object Storage instead of MySQL or Redis.
