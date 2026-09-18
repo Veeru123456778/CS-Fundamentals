@@ -725,3 +725,336 @@ We'll deep dive into:
 - ETags and checksum verification.
 - Physical storage, replication, and durability.
 - Why Netflix uses Object Storage instead of MySQL or Redis.
+
+
+
+# Netflix System Design — Part 3: Object Storage Internals (How S3 Stores a 200 GB Movie)
+
+## Goal
+
+Understand what happens **inside Object Storage** after multipart upload completes.
+
+This chapter answers:
+
+- What exactly is Object Storage?
+- How is `master.mov` physically stored?
+- How does S3 provide durability?
+- Why are multipart upload chunks deleted?
+- How is a 200 GB object stored across disks and machines?
+
+> **Scope:** Storage internals only. We are still not discussing transcoding or streaming.
+
+---
+
+# The Biggest Misconception
+
+A lot of people think S3 stores the uploaded multipart chunks forever.
+
+**That is NOT true.**
+
+There are **two different kinds of chunks**.
+
+| Multipart Upload Parts | Internal Storage Blocks |
+|-------------------------|-------------------------|
+| Created by the client during upload. | Created internally by Object Storage after upload completes. |
+| Temporary. | Permanent. |
+| Used only for reliable upload. | Used for durability and reads. |
+| Deleted after upload completes. | Exist until the object is deleted. |
+
+**Important Note**
+
+> Multipart upload chunks solve the **upload problem**. Internal storage blocks solve the **durability problem**.
+
+---
+
+# What Happens After `CompleteMultipartUpload`?
+
+## Before Completion
+
+```text
+Upload Session (upload_id = upl_9a81f3)
+
+Part 1
+Part 2
+Part 3
+...
+Part 3200
+```
+
+These are temporary upload artifacts.
+
+## After Completion
+
+```text
+assets/
+└── movie_8472/
+    └── master.mov (200 GB)
+```
+
+Now S3 exposes a **single object** called `master.mov`.
+
+---
+
+# Does S3 Keep the Whole 200 GB File on One Disk?
+
+**No.**
+
+A single disk storing an entire 200 GB object would be inefficient and unreliable.
+
+Instead, S3 internally breaks the object into storage blocks.
+
+```mermaid
+flowchart LR
+    A["master.mov (200 GB)"]
+
+    A --> B1["Storage Block 1"]
+    A --> B2["Storage Block 2"]
+    A --> B3["Storage Block 3"]
+    A --> B4["..."]
+    A --> Bn["Storage Block N"]
+```
+
+### Important
+
+These storage blocks are created **by S3**, not by the upload client.
+
+The application never sees these blocks.
+
+---
+
+# Intuition — Multipart Parts vs Storage Blocks
+
+Suppose the upload client used **64 MB** parts.
+
+```text
+Upload Parts
+
+Part 1 = Bytes 0-64 MB
+Part 2 = Bytes 64-128 MB
+Part 3 = Bytes 128-192 MB
+```
+
+After completion:
+
+```text
+master.mov
+```
+
+S3 may internally store it as completely different storage blocks.
+
+Example (conceptually):
+
+```text
+Storage Block A
+Storage Block B
+Storage Block C
+Storage Block D
+...
+```
+
+The storage block size is an **internal implementation detail** and is unrelated to multipart upload part size.
+
+---
+
+# Object Metadata
+
+Every object has metadata.
+
+## Example Metadata Record
+
+| Field | Purpose |
+|-------|---------|
+| object_key | `assets/movie_8472/master.mov` |
+| object_size | 200 GB |
+| content_type | video/quicktime |
+| checksum | SHA256 of full object |
+| storage_locations | Internal block locations |
+| created_at | Upload completion time |
+
+### Why Metadata?
+
+Metadata tells S3 **where every storage block lives**.
+
+The object itself is reconstructed from those locations.
+
+---
+
+# How Durability Works
+
+Durability is **not** achieved by keeping upload parts.
+
+It is achieved by storing storage blocks across multiple storage nodes.
+
+## Simplified Architecture
+
+```mermaid
+flowchart TD
+    A["master.mov"]
+
+    A --> N1["Storage Node A"]
+    A --> N2["Storage Node B"]
+    A --> N3["Storage Node C"]
+```
+
+Each node stores part of the object's data.
+
+If one node fails, the object can still be reconstructed.
+
+---
+
+# Replication (Simple Intuition)
+
+One approach is replication.
+
+```text
+Storage Node A → Copy 1
+Storage Node B → Copy 2
+Storage Node C → Copy 3
+```
+
+Three copies of the data exist.
+
+### Pros
+
+- Very simple recovery.
+- Fast reads.
+
+### Cons
+
+- Expensive storage (3× space).
+
+---
+
+# Erasure Coding (What Large Object Stores Commonly Use)
+
+Instead of storing three complete copies, S3 commonly uses **erasure coding**.
+
+## Example
+
+Original data:
+
+```text
+D1 D2 D3 D4 D5 D6
+```
+
+Parity blocks generated:
+
+```text
+P1 P2 P3
+```
+
+Stored across different storage nodes.
+
+```text
+Node A : D1 D2
+Node B : D3 D4
+Node C : D5 D6
+Node D : P1
+Node E : P2
+Node F : P3
+```
+
+### Intuition
+
+If one or more nodes fail, parity information reconstructs the missing data.
+
+Storage overhead is much lower than replication.
+
+> We'll study erasure coding deeply in a separate Distributed Systems chapter.
+
+---
+
+# Reading `master.mov`
+
+Suppose a transcoding worker requests:
+
+```text
+master.mov
+```
+
+The worker does **not** know about storage blocks.
+
+```mermaid
+sequenceDiagram
+    participant Worker
+    participant S3
+    participant StorageNodes
+
+    Worker->>S3: GET master.mov
+    S3->>StorageNodes: Read required storage blocks
+    StorageNodes-->>S3: Blocks
+    S3-->>Worker: Continuous byte stream
+```
+
+S3 reconstructs the original byte stream transparently.
+
+The worker receives a normal file.
+
+---
+
+# What Happens If One Storage Node Fails?
+
+Example:
+
+```text
+Node B crashes.
+```
+
+### S3 Behavior
+
+1. Detect missing blocks.
+2. Read remaining data blocks.
+3. Reconstruct missing block using replicas/parity.
+4. Create a new copy on another healthy node.
+
+The application never notices.
+
+---
+
+# Why Delete Multipart Upload Parts?
+
+Once `master.mov` exists:
+
+- Upload parts are no longer needed.
+- They consume storage.
+- They are tied to a temporary upload session.
+
+Deleting them reduces storage cost.
+
+**Durability is already provided by the final object's storage blocks.**
+
+---
+
+# Object Lifecycle After Upload
+
+```mermaid
+stateDiagram-v2
+    [*] --> UploadParts
+    UploadParts --> CompleteMultipartUpload
+    CompleteMultipartUpload --> MasterObjectCreated
+    MasterObjectCreated --> MultipartPartsDeleted
+    MultipartPartsDeleted --> DurableObjectStored
+```
+
+---
+
+# Key Takeaways
+
+- `master.mov` is a **single logical object** after multipart upload completes.
+- Multipart upload parts are **temporary upload artifacts** and are deleted after completion.
+- S3 internally divides `master.mov` into **storage blocks**, which are different from upload parts.
+- Object metadata stores where those storage blocks are located.
+- Durability comes from replication or erasure coding of storage blocks across multiple storage nodes—not from keeping upload chunks.
+
+---
+
+# Next Chapter
+
+## Part 4 — Transcoding Pipeline Internals
+
+We'll learn:
+
+1. How `master.mov` becomes 240p, 360p, 720p, 1080p and 4K.
+2. FFmpeg workers and job queues.
+3. Audio, subtitles and HDR processing.
+4. Why Netflix creates multiple renditions before streaming.
