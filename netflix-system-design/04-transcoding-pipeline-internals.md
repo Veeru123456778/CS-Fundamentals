@@ -499,3 +499,405 @@ We'll answer:
 - How does it stream bytes from Object Storage?
 - How FFmpeg decodes, scales, and encodes video.
 - CPU, memory, disk, and parallel processing inside a transcoding worker.
+
+
+
+# Netflix System Design — Part 5: FFmpeg Worker Internals (How One Rendition Is Created)
+
+## Goal
+
+Understand what happens **inside one transcoding worker** after it receives a Kafka job.
+
+This chapter answers:
+
+- Does the worker download the entire 200 GB movie?
+- How does it read from Object Storage?
+- How does FFmpeg decode and encode video?
+- How are CPU, RAM, and disk used?
+- What is uploaded after transcoding finishes?
+
+> **Scope:** We cover only one worker processing one rendition (for example, 720p). Segmentation into HLS/DASH chunks comes in the next chapter.
+
+---
+
+# Where We Left Off
+
+A worker receives one Kafka job.
+
+```json
+{
+  "job_id": "job_720p",
+  "asset_id": "movie_8472",
+  "object_key": "assets/movie_8472/master.mov",
+  "target_resolution": "720p",
+  "codec": "H264",
+  "bitrate": "3Mbps"
+}
+```
+
+The worker's responsibility is to produce:
+
+```text
+720p/video.mp4
+```
+
+---
+
+# High-Level Worker Flow
+
+```mermaid
+flowchart TD
+    A["Kafka Job"] --> B["Read master.mov from Object Storage"]
+    B --> C["FFmpeg Decoder"]
+    C --> D["Resize + Encode to Target Quality"]
+    D --> E["Upload Output Video to Object Storage"]
+    E --> F["Mark Job COMPLETED"]
+```
+
+---
+
+# Step 1 — Worker Reads `master.mov`
+
+The worker receives only the **object key**.
+
+```text
+assets/movie_8472/master.mov
+```
+
+### Question: Does it download the entire 200 GB first?
+
+**No.**
+
+The worker streams the object from Object Storage.
+
+---
+
+# Streaming From Object Storage
+
+The worker issues a normal object read.
+
+```http
+GET /assets/movie_8472/master.mov
+```
+
+Object Storage returns a **continuous byte stream**.
+
+```text
+Storage Blocks
+      ↓
+Object Storage
+      ↓
+Continuous Binary Stream
+      ↓
+FFmpeg
+```
+
+### Why streaming instead of downloading?
+
+- Doesn't require 200 GB RAM.
+- Doesn't wait for the full file before processing.
+- Starts decoding immediately.
+
+---
+
+# Step 2 — How FFmpeg Reads the Stream
+
+FFmpeg consumes the incoming bytes sequentially.
+
+```text
+Object Storage Stream
+        │
+        ▼
+Decoder Buffer
+        ▼
+Video Frames
+```
+
+FFmpeg maintains an internal read buffer.
+
+### Important
+
+- It reads a small portion of bytes.
+- Decodes those bytes into frames.
+- Requests more bytes as needed.
+
+It does **not** load the complete movie into memory.
+
+---
+
+# Step 3 — Decode the Video
+
+The uploaded movie is usually stored in a high-quality codec like ProRes.
+
+FFmpeg first **decodes** compressed bytes into raw frames.
+
+### Input
+
+```text
+Compressed Video Bytes
+```
+
+### Output
+
+```text
+Frame 1
+Frame 2
+Frame 3
+Frame 4
+...
+```
+
+### Intuition
+
+A video is essentially a sequence of images.
+
+For a 24 FPS movie:
+
+```text
+1 second = 24 frames
+```
+
+A 2-hour movie contains more than **170,000 frames**.
+
+---
+
+# Step 4 — Scale Frames
+
+The worker is processing the **720p** job.
+
+Each decoded frame is resized.
+
+```text
+Original Frame
+
+3840 × 2160
+
+        ↓
+
+1280 × 720
+```
+
+Every frame is resized independently.
+
+### Different Workers Produce Different Sizes
+
+| Job | Output Resolution |
+|------|-------------------|
+| 240p | 426 × 240 |
+| 360p | 640 × 360 |
+| 480p | 854 × 480 |
+| 720p | 1280 × 720 |
+| 1080p | 1920 × 1080 |
+| 4K | 3840 × 2160 |
+
+---
+
+# Step 5 — Encode the Frames
+
+Resized frames are encoded into a streaming codec.
+
+Example:
+
+| Input Codec | Output Codec |
+|-------------|--------------|
+| ProRes | H.264 |
+| ProRes HDR | H.265 |
+
+### Why Encode Again?
+
+Raw frames are enormous.
+
+Encoding compresses them dramatically.
+
+Example:
+
+| Stage | Approx Size |
+|-------|-------------|
+| Raw decoded frames | Several TB |
+| Encoded 720p video | Few GB |
+
+---
+
+# Step 6 — Apply Target Bitrate
+
+Resolution is not enough.
+
+The worker also applies bitrate.
+
+### Example
+
+| Rendition | Bitrate |
+|-----------|---------|
+| 240p | 300 kbps |
+| 720p | 3 Mbps |
+| 1080p | 5 Mbps |
+| 4K HDR | 18 Mbps |
+
+### Why?
+
+Bitrate controls visual quality and file size.
+
+Higher bitrate means more information per second.
+
+---
+
+# Step 7 — CPU, RAM, and Disk Usage
+
+### CPU
+
+Encoding is CPU-intensive.
+
+Most CPU time is spent compressing frames.
+
+### RAM
+
+RAM stores only:
+
+- Decoder buffers.
+- A few frames being processed.
+- Encoder buffers.
+
+**Not** the whole movie.
+
+### Disk
+
+Workers usually write intermediate output to local SSD.
+
+```text
+Local SSD
+
+/tmp/job_720p/output.mp4
+```
+
+Why?
+
+Encoding continuously writes bytes before upload.
+
+---
+
+# Step 8 — Upload Output to Object Storage
+
+After encoding finishes:
+
+```text
+output.mp4
+```
+
+Worker uploads it.
+
+### Object Storage Path
+
+```text
+assets/movie_8472/renditions/
+
+720p/video.mp4
+```
+
+Every rendition has its own folder.
+
+Example:
+
+```text
+renditions/
+
+240p/video.mp4
+360p/video.mp4
+480p/video.mp4
+720p/video.mp4
+1080p/video.mp4
+4k/video.mp4
+```
+
+---
+
+# Step 9 — Update Job Status
+
+Worker updates metadata.
+
+## transcoding_jobs
+
+| Field | Value |
+|-------|-------|
+| job_id | job_720p |
+| status | COMPLETED |
+| output_key | renditions/720p/video.mp4 |
+| completed_at | Timestamp |
+
+Only after this succeeds does the worker commit the Kafka offset.
+
+---
+
+# What Happens If Upload Fails?
+
+```text
+Encoding Finished ✅
+
+Upload Failed ❌
+```
+
+### Worker Behavior
+
+- Retry upload.
+- Do **not** commit Kafka offset.
+- If worker crashes, Kafka redelivers the job.
+
+No rendition is lost.
+
+---
+
+# Failure Scenarios
+
+| Scenario | Worker Behavior |
+|----------|-----------------|
+| Object Storage temporarily unavailable | Retry upload. |
+| FFmpeg crashes during encoding | Job marked FAILED and retried. |
+| Worker machine crashes before upload | Kafka redelivers job. |
+| Worker crashes after upload but before offset commit | Duplicate processing is safe (idempotent output path). |
+
+---
+
+# End State After All Workers Finish
+
+Object Storage now contains multiple encoded videos.
+
+```text
+assets/
+└── movie_8472/
+    ├── master.mov
+    └── renditions/
+        ├── 240p/video.mp4
+        ├── 360p/video.mp4
+        ├── 480p/video.mp4
+        ├── 720p/video.mp4
+        ├── 1080p/video.mp4
+        └── 4k/video.mp4
+```
+
+The original `master.mov` is still preserved.
+
+It is never modified.
+
+---
+
+# Key Takeaways
+
+- Workers **stream** `master.mov` from Object Storage instead of downloading 200 GB first.
+- FFmpeg performs four major steps: **decode → scale → encode → write output**.
+- RAM holds only a small working set of frames, not the full movie.
+- CPU is the primary bottleneck during encoding.
+- Each worker uploads one encoded rendition back to Object Storage.
+- `master.mov` remains the immutable source of truth.
+
+---
+
+# Next Chapter
+
+## Part 6 — HLS/DASH Segmentation Internals
+
+We'll learn:
+
+- Why `720p/video.mp4` is still not streamed directly.
+- How Netflix cuts videos into 2-second segments.
+- `.m3u8` playlists and manifest generation.
+- Keyframes and why segment boundaries matter.
+- How adaptive bitrate streaming works.
