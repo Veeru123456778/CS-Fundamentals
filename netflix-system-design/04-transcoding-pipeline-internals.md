@@ -2,15 +2,24 @@
 
 ## Goal
 
-Understand how Netflix converts a single uploaded **master video (`master.mov`)** into multiple streaming-ready video versions (240p, 360p, 720p, 1080p, 4K).
+Understand how Netflix converts one uploaded **master video (`master.mov`)** into multiple streaming-ready versions (240p, 360p, 480p, 720p, 1080p, 4K).
 
-> **Scope:** This chapter covers only how the transcoding pipeline starts and how jobs are created. We will cover FFmpeg, segmentation, audio, subtitles, and HDR in the next sections.
+This chapter covers the **entire orchestration pipeline**:
+
+- Who starts transcoding?
+- How jobs are created.
+- Why Kafka is used.
+- How workers consume jobs.
+- How failures and retries work.
+- What happens before FFmpeg starts processing.
+
+> **Scope:** We stop just before FFmpeg begins transcoding. FFmpeg internals are Part 5.
 
 ---
 
 # Where We Left Off
 
-After Part 3, we have one durable object stored in Object Storage.
+After multipart upload completes, Object Storage contains one durable object.
 
 ```text
 assets/
@@ -18,226 +27,475 @@ assets/
     └── master.mov (200 GB)
 ```
 
-The upload is complete, but users still **cannot stream** this movie.
+The upload service marks the asset as:
 
-**Why?**
+```text
+READY_FOR_PROCESSING
+```
 
-- It exists in only one master format.
-- There are no lower-quality versions.
-- There are no streaming segments.
-- There are no manifests.
-
-The next step is **transcoding**.
+Users still **cannot stream** this movie because only one master asset exists.
 
 ---
 
-# What is Transcoding?
-
-**Transcoding** is the process of converting one master video into multiple video renditions optimized for streaming.
-
-### Example
-
-| Input | Outputs |
-|-------|---------|
-| `master.mov` (4K ProRes, 200 GB) | 240p, 360p, 480p, 720p, 1080p, 4K (H.264/H.265) |
-
-### Why is it needed?
-
-Different users have different:
-
-- Internet speeds.
-- Devices.
-- Screen resolutions.
-
-Netflix prepares multiple versions before anyone starts watching.
-
----
-
-# High-Level Pipeline
+# High-Level Architecture
 
 ```mermaid
 flowchart LR
-    A["master.mov (Object Storage)"]
-    B["Transcoding Orchestrator"]
-    C["Job Queue"]
-    D["Transcoding Workers"]
+    Upload["Upload Service"] --> Orchestrator["Transcoding Orchestrator"]
+    Orchestrator --> Kafka["Kafka Topic: transcoding-jobs"]
 
-    A --> B
-    B --> C
-    C --> D
+    Kafka --> W1["Worker A"]
+    Kafka --> W2["Worker B"]
+    Kafka --> W3["Worker C"]
+    Kafka --> W4["Worker D"]
+
+    W1 --> Storage[(Object Storage)]
+    W2 --> Storage
+    W3 --> Storage
+    W4 --> Storage
 ```
 
 ---
 
-# Step 1 — Upload Completion Triggers the Pipeline
+# Step 1 — Upload Completion Triggers Transcoding
 
-The upload service finishes multipart upload.
+When `/uploads/complete` succeeds:
 
-## Backend Flow
+### Backend Flow
 
-1. Upload session becomes `READY_FOR_PROCESSING`.
-2. Asset metadata is updated.
-3. A transcoding job is created.
+1. Multipart upload finishes.
+2. `master.mov` is created in Object Storage.
+3. Asset metadata is updated.
+4. Upload service calls the **Transcoding Orchestrator**.
 
-### State Change
+### Asset State
 
 | Stage | Status |
 |-------|--------|
 | Uploading | `IN_PROGRESS` |
-| Upload Complete | `READY_FOR_PROCESSING` |
-| Transcoding Started | `TRANSCODING` |
+| Upload Finished | `READY_FOR_PROCESSING` |
+| Jobs Created | `TRANSCODING` |
+
+**Important**
+
+The upload service **does not** start transcoding itself.
+
+Its only responsibility is to notify the orchestrator.
 
 ---
 
 # Step 2 — Transcoding Orchestrator
 
-A dedicated backend service is responsible for starting processing.
+The orchestrator is a stateless backend service.
 
-### Responsibilities
+## Responsibilities
 
-- Read newly uploaded assets.
-- Decide which renditions to generate.
+- Read uploaded asset metadata.
+- Decide which renditions need to be generated.
 - Create transcoding jobs.
-- Push jobs into a queue.
+- Publish jobs to Kafka.
+- Update asset state.
 
-> It does **not** process video itself.
-
----
-
-# Step 3 — Create Jobs
-
-Suppose the uploaded movie is available in 4K HDR.
-
-The orchestrator creates independent jobs.
-
-| Job | Output |
-|-----|--------|
-| Job 1 | 240p |
-| Job 2 | 360p |
-| Job 3 | 480p |
-| Job 4 | 720p |
-| Job 5 | 1080p |
-| Job 6 | 4K HDR |
-
-Each rendition becomes a separate processing task.
+It never processes video bytes.
 
 ---
 
-# Why Separate Jobs?
+# Step 3 — Decide Which Renditions to Generate
 
-Instead of one huge transcoding task:
+Suppose the uploaded movie is **4K HDR**.
+
+Netflix creates one job for every required rendition.
+
+| Rendition | Codec | Bitrate |
+|-----------|-------|---------|
+| 240p | H.264 | 300 kbps |
+| 360p | H.264 | 700 kbps |
+| 480p | H.264 | 1.2 Mbps |
+| 720p | H.264 | 3 Mbps |
+| 1080p | H.264 | 5 Mbps |
+| 4K HDR | H.265 | 15–25 Mbps |
+
+### Important
+
+One uploaded movie becomes **multiple independent jobs**.
+
+---
+
+# Step 4 — Publish Jobs to Kafka
+
+The orchestrator acts as a **Kafka Producer**.
+
+## Topic
 
 ```text
-master.mov
-    ↓
-Everything
+Topic Name: transcoding-jobs
 ```
 
-Netflix creates parallel jobs.
-
-```text
-master.mov
-   ├── 240p Job
-   ├── 360p Job
-   ├── 480p Job
-   ├── 720p Job
-   ├── 1080p Job
-   └── 4K Job
-```
-
-### Benefits
-
-- Jobs run in parallel.
-- Failure of one rendition doesn't affect others.
-- Workers can scale independently.
-
----
-
-# Step 4 — Job Queue
-
-The orchestrator publishes jobs to a distributed queue.
-
-### Example Job Message
+### Messages Published
 
 ```json
 {
-  "job_id": "job_78291",
+  "job_id": "job_240p",
+  "asset_id": "movie_8472",
+  "object_key": "assets/movie_8472/master.mov",
+  "target_resolution": "240p",
+  "codec": "H264",
+  "bitrate": "300kbps"
+}
+```
+
+Another message:
+
+```json
+{
+  "job_id": "job_720p",
   "asset_id": "movie_8472",
   "object_key": "assets/movie_8472/master.mov",
   "target_resolution": "720p",
   "codec": "H264",
-  "bitrate": "5 Mbps"
+  "bitrate": "3Mbps"
 }
 ```
 
-### Why Use a Queue?
+### Kafka Topic After Publishing
 
-- Decouples upload service from transcoding.
-- Buffers thousands of uploaded movies.
-- Workers consume jobs at their own speed.
+```text
+transcoding-jobs
 
----
-
-# Step 5 — Transcoding Workers
-
-Workers continuously poll the queue.
-
-```mermaid
-sequenceDiagram
-    participant Queue
-    participant Worker
-
-    Queue-->>Worker: 720p Transcoding Job
-    Worker-->>Queue: Job Acknowledged
+Offset 0 → 240p Job
+Offset 1 → 360p Job
+Offset 2 → 480p Job
+Offset 3 → 720p Job
+Offset 4 → 1080p Job
+Offset 5 → 4K HDR Job
 ```
 
-Each worker processes **one job**.
-
-Examples:
-
-| Worker | Processing |
-|--------|------------|
-| Worker A | 240p |
-| Worker B | 720p |
-| Worker C | 1080p |
-| Worker D | 4K HDR |
-
-Workers are stateless and horizontally scalable.
+Kafka stores these messages until workers consume them.
 
 ---
 
-# What Happens Next?
+# Why Kafka Instead of Calling Workers Directly?
 
-A worker has received a job.
+| Direct API Call | Kafka |
+|-----------------|-------|
+| Upload service waits for workers. | Upload service publishes and returns immediately. |
+| Workers must already exist. | Workers consume whenever available. |
+| Tight coupling. | Loose coupling. |
+| Difficult retries. | Built-in retry through offsets. |
+| Poor scalability. | Thousands of workers can consume jobs. |
 
-Its next task is to:
+**Intuition**
 
-1. Read `master.mov` from Object Storage.
-2. Decode the video.
-3. Encode it into the target resolution and codec.
-4. Upload the generated rendition back to Object Storage.
+Kafka acts as a durable buffer between upload and transcoding.
 
-This is the next section.
+---
+
+# Step 5 — Kafka Partitions
+
+Suppose Netflix has many uploaded movies.
+
+```text
+Topic: transcoding-jobs
+
+Partition 0
+Partition 1
+Partition 2
+Partition 3
+```
+
+### Example Distribution
+
+```text
+P0
+Movie1-240p
+Movie2-720p
+
+P1
+Movie1-360p
+Movie3-1080p
+
+P2
+Movie1-480p
+Movie4-4K
+
+P3
+Movie1-720p
+Movie2-240p
+```
+
+### Why Partitions?
+
+- Many workers can consume simultaneously.
+- Jobs are distributed across machines.
+
+**Partition Key**
+
+Usually `job_id` (or another unique job identifier), so jobs are spread evenly across partitions.
+
+---
+
+# Step 6 — Consumer Group
+
+All transcoding workers belong to one consumer group.
+
+```text
+Consumer Group
+
+transcoding-workers
+```
+
+Workers:
+
+```text
+Worker A
+Worker B
+Worker C
+Worker D
+```
+
+Kafka assigns partitions.
+
+| Worker | Assigned Partitions |
+|--------|----------------------|
+| Worker A | Partition 0 |
+| Worker B | Partition 1 |
+| Worker C | Partition 2 |
+| Worker D | Partition 3 |
+
+Each message is processed by **exactly one worker** within the consumer group.
+
+---
+
+# Important Question — Does Every Quality Have Its Own Worker?
+
+**No.**
+
+Workers are **generic transcoding workers**.
+
+Any worker can process any rendition.
+
+### Example
+
+| Worker | Job Picked |
+|--------|------------|
+| Worker A | Movie1 → 240p |
+| Worker B | Movie1 → 360p |
+| Worker C | Movie2 → 720p |
+| Worker D | Movie1 → 4K |
+
+Workers do **not** specialize in 240p or 720p.
+
+The job message tells the worker what to produce.
+
+### Why?
+
+- Better load balancing.
+- Easy horizontal scaling.
+- Workers remain stateless.
+
+---
+
+# Step 7 — Worker Lifecycle
+
+Every worker runs an infinite polling loop.
+
+```mermaid
+flowchart TD
+    A["Poll Kafka"] --> B["Receive Job"]
+    B --> C["Mark Job RUNNING"]
+    C --> D["Download/Stream master.mov"]
+    D --> E["Run FFmpeg"]
+    E --> F["Upload Output"]
+    F --> G["Commit Kafka Offset"]
+    G --> A
+```
+
+### Step-by-Step
+
+1. Poll Kafka.
+2. Receive one job.
+3. Mark status as `RUNNING`.
+4. Read input movie.
+5. Transcode.
+6. Upload result.
+7. Commit Kafka offset.
+
+Then poll for the next job.
+
+---
+
+# Step 8 — Job Status Tracking
+
+Netflix stores job metadata separately.
+
+## transcoding_jobs Table
+
+| Column | Purpose |
+|--------|---------|
+| job_id | Unique transcoding job |
+| asset_id | Movie being processed |
+| rendition | 720p / 1080p / 4K |
+| status | PENDING / RUNNING / COMPLETED / FAILED |
+| worker_id | Worker processing it |
+| retry_count | Retry attempts |
+| output_key | Final storage location |
+
+### State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING
+    PENDING --> RUNNING
+    RUNNING --> COMPLETED
+    RUNNING --> FAILED
+    FAILED --> PENDING
+```
+
+---
+
+# Step 9 — What Happens If A Worker Crashes?
+
+Example:
+
+```text
+Worker B receives 720p job.
+
+Starts processing.
+
+Machine crashes.
+```
+
+### Kafka Behavior
+
+The worker never commits its offset.
+
+Kafka still considers the message **unprocessed**.
+
+After a timeout:
+
+```text
+Worker D receives the same job.
+```
+
+The job is executed again.
+
+No manual retry is needed.
+
+---
+
+# Step 10 — Offset Commit (Very Important)
+
+### Wrong Order ❌
+
+```text
+Receive Job
+Commit Offset
+Start FFmpeg
+Crash
+```
+
+Job is permanently lost.
+
+### Correct Order ✅
+
+```text
+Receive Job
+Start FFmpeg
+Upload Output
+Commit Offset
+```
+
+Kafka offset is committed **only after successful upload**.
+
+This guarantees **at-least-once processing**.
+
+---
+
+# Step 11 — Why Is Duplicate Processing Safe?
+
+Suppose Worker B crashes after uploading output but before committing offset.
+
+Worker D receives the same job.
+
+Two workers may attempt the same rendition.
+
+### Why Safe?
+
+Every job has a unique `job_id`.
+
+Workers write output to a deterministic path.
+
+Example:
+
+```text
+assets/movie_8472/renditions/720p/video.mp4
+```
+
+The storage layer or job table ensures duplicate completion is ignored or safely overwritten.
+
+This makes transcoding **idempotent**.
+
+---
+
+# Step 12 — What Happens After A Job Completes?
+
+Worker uploads the generated rendition.
+
+Example:
+
+```text
+assets/movie_8472/renditions/
+
+240p/video.mp4
+360p/video.mp4
+480p/video.mp4
+720p/video.mp4
+1080p/video.mp4
+4k/video.mp4
+```
+
+The worker updates the job table.
+
+```text
+Status = COMPLETED
+```
+
+The orchestrator waits until **all required rendition jobs** finish before moving the asset to the next pipeline stage.
+
+---
+
+# Failure Scenarios
+
+| Scenario | Netflix Behavior |
+|----------|------------------|
+| Worker crashes before offset commit | Kafka redelivers the job. |
+| Worker crashes after upload but before commit | Duplicate job runs safely (idempotent). |
+| FFmpeg fails due to corrupt input | Job marked FAILED and retried. |
+| Kafka unavailable temporarily | Orchestrator retries publishing jobs. |
+| One rendition fails (720p) | Other renditions continue processing independently. |
 
 ---
 
 # Key Takeaways
 
-- Upload completion **does not** immediately create streaming files.
-- A **Transcoding Orchestrator** starts the processing pipeline.
-- Every output resolution is a separate job.
-- Jobs are placed into a distributed queue.
-- Stateless transcoding workers consume jobs independently.
+- The **Upload Service** only signals that `master.mov` is ready.
+- A **Transcoding Orchestrator** creates one job for each required rendition.
+- The orchestrator is a **Kafka producer** and publishes jobs to `transcoding-jobs`.
+- Kafka partitions distribute jobs across many workers.
+- Workers are **generic**; they can process any resolution based on the job message.
+- Workers commit Kafka offsets **only after** the output rendition is successfully uploaded.
+- Jobs are **idempotent**, so retries and duplicate deliveries are safe.
+- After all rendition jobs complete, Netflix proceeds to the segmentation pipeline.
 
 ---
 
-# Next Section
+# Next Chapter
 
-## Part 4.2 — FFmpeg Worker Internals
+## Part 5 — FFmpeg Worker Internals
 
 We'll answer:
 
-- Does the worker download the entire 200 GB movie?
-- How does FFmpeg read from Object Storage?
-- How are decoding and encoding performed?
-- How much RAM and CPU does one worker use?
+- Does a worker download the full 200 GB movie?
+- How does it stream bytes from Object Storage?
+- How FFmpeg decodes, scales, and encodes video.
+- CPU, memory, disk, and parallel processing inside a transcoding worker.
