@@ -548,6 +548,135 @@ stateDiagram-v2
 
 ---
 
+
+## ⭐ Important Note — Upload Chunks vs Streaming Chunks
+
+This is one of the most important concepts in Netflix's upload pipeline.
+
+### There are **two completely different types of chunks**.
+
+| Upload Chunks | Streaming Chunks |
+|---------------|------------------|
+| Used only during **upload** of the master video. | Used when **users watch** the movie. |
+| Fixed-size chunks (for example, **64 MB** each). | Fixed-duration chunks (for example, **2-second** video segments). |
+| Created by the **upload client**. | Created by the **transcoding pipeline**. |
+| Temporary objects stored during upload. | Permanent streaming assets stored for playback. |
+| Never served to users. | Always served to users. |
+
+### Intuition
+
+- **Upload chunks** solve a **network reliability problem** (resume uploads, retries, parallel uploads).
+- **Streaming chunks** solve a **video playback problem** (adaptive quality, seeking, buffering).
+
+**Rule to remember:** Multipart upload chunks are an upload optimization, not a streaming format.
+
+---
+
+# How Does S3/Object Storage Assemble the Chunks?
+
+This is **not automatic**.
+
+The client explicitly tells Object Storage to assemble the uploaded parts after every chunk has been uploaded successfully.
+
+### Step-by-Step
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant S3
+
+    Client->>S3: Upload Part 1
+    Client->>S3: Upload Part 2
+    Client->>S3: Upload Part 3
+    Client->>S3: ...
+    Client->>S3: Complete Multipart Upload (ordered list of parts)
+
+    S3-->>Client: Final object created
+```
+
+### What does S3 store while uploading?
+
+Temporary parts:
+
+```text
+Upload Session (upload_id = upl_9a81f3)
+
+Part 1
+Part 2
+Part 3
+...
+Part 3200
+```
+
+Each uploaded part gets an **ETag** (its identifier inside S3).
+
+### Complete Multipart Upload Request
+
+The client sends the **ordered list** of uploaded parts.
+
+```json
+{
+  "upload_id": "upl_9a81f3",
+  "parts": [
+    { "part_number": 1, "etag": "etag1" },
+    { "part_number": 2, "etag": "etag2" },
+    { "part_number": 3, "etag": "etag3" }
+  ]
+}
+```
+
+### How does S3 know the order?
+
+**Order is determined by `part_number`, not upload time.**
+
+Even if:
+
+| Upload Order | Part Number |
+|--------------|-------------|
+| First uploaded | 5 |
+| Second uploaded | 2 |
+| Third uploaded | 1 |
+
+S3 creates the final object as:
+
+```text
+Part 1 + Part 2 + Part 5
+```
+
+because the completion request specifies the order.
+
+### Does S3 copy all 200 GB again?
+
+**No.**
+
+Conceptually, S3 already has every uploaded part stored internally.
+
+During **Complete Multipart Upload**, S3 creates a **new object metadata entry** that references the uploaded parts in the specified order and exposes them as one logical object (`master.mov`). The multipart upload is finalized, and the temporary upload parts are removed.
+
+> From the client's perspective, it instantly becomes one 200 GB object without re-uploading the data.
+
+### Final Result
+
+Before completion:
+
+```text
+Multipart Upload
+├── Part 1
+├── Part 2
+├── Part 3
+└── Part 3200
+```
+
+After completion:
+
+```text
+assets/
+└── movie_8472/
+    └── master.mov (200 GB)
+```
+
+The application now reads `master.mov` like a normal file, without knowing multipart upload was ever used.
+
 # Failure Scenarios
 
 | Scenario | Netflix Behavior |
