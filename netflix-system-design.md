@@ -675,7 +675,20 @@ assets/
     └── master.mov (200 GB)
 ```
 
+Multipart upload parts are temporary storage used only during upload. After CompleteMultipartUpload, S3 reconstructs the original binary file (master.mov) and removes the temporary parts. So the file master.mov has all the info regarding all the parts that we have in S3 as a single object file.
+
 The application now reads `master.mov` like a normal file, without knowing multipart upload was ever used.
+
+# What happens after Completion
+
+This is for maintaining the durability of the file:
+
+master.mov (200 GB)
+        │
+        ├── Stored across multiple storage nodes
+        ├── Replicated / Erasure Coded
+        └── Metadata tracks where each data block lives
+
 
 # Failure Scenarios
 
