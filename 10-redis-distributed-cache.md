@@ -6,6 +6,9 @@ Understand what Redis is, why distributed systems need it, how it works internal
 
 > **Technology Agnostic Note:** Redis is an independent in-memory database. Every backend technology (Java, Go, Node.js, Python, .NET, Rust, etc.) connects to Redis over TCP.
 
+**Important** : Redis is a Single threaded server means at a time in executing the queries only one main thread will execute a query and then other queries will wait. No multiple queries will run in parallel.
+So by default there will be no locks required in redis and it is self sufficient to provide locking to data because at a time only when thread will modify any value.(So no lock overhead)
+
 ---
 
 # 1. Why Do We Need Redis?
