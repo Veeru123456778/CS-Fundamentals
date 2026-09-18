@@ -945,6 +945,101 @@ It tells S3:
 
 Applications never access storage blocks directly.
 
+
+## Storage Locations — The Most Important Object Storage Concept
+
+`master.mov` is a **logical object**. It is **not stored as one 200 GB file on a single disk**.
+
+Instead, S3 stores two things:
+
+1. **Object Metadata** (small metadata record).
+2. **Storage Blocks** (actual binary data).
+
+### Object Metadata Example
+
+| Field | Value |
+|-------|-------|
+| object_key | `assets/movie_8472/master.mov` |
+| object_size | 200 GB |
+| checksum | SHA256(...) |
+| storage_locations | `[blk_101, blk_102, blk_103, ..., blk_450]` |
+
+### What is `storage_locations`?
+
+It is an internal mapping that tells S3:
+
+> **Which storage blocks belong to this object and in what order.**
+
+Example:
+
+| Block ID | Stored On |
+|----------|-----------|
+| `blk_101` | Storage Node A |
+| `blk_102` | Storage Node F |
+| `blk_103` | Storage Node C |
+| `blk_104` | Storage Node B |
+
+The metadata stores this ordered list.
+
+---
+
+## How `GET master.mov` Works
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant S3
+    participant Metadata
+    participant Nodes
+
+    Client->>S3: GET master.mov
+    S3->>Metadata: Lookup storage_locations
+    Metadata-->>S3: blk101, blk102, blk103, blk104...
+    S3->>Nodes: Fetch blocks in order
+    Nodes-->>S3: Block bytes
+    S3-->>Client: One continuous byte stream
+```
+
+### Does S3 create one 200 GB file in RAM?
+
+**No.**
+
+S3 **streams** the blocks one after another.
+
+```text
+Read blk101 bytes
+        ↓
+Read blk102 bytes
+        ↓
+Read blk103 bytes
+        ↓
+Read blk104 bytes
+        ↓
+Send continuous binary stream to client
+```
+
+The client receives:
+
+```text
+master.mov bytes
+= bytes(blk101)
++ bytes(blk102)
++ bytes(blk103)
++ bytes(blk104)
++ ...
+```
+
+It looks exactly like one normal `.mov` file.
+
+---
+
+## Important Intuition
+
+- `master.mov` **does not store another aggregated copy of the bytes.**
+- The bytes already exist inside storage blocks.
+- `storage_locations` is simply the index that tells S3 **where to fetch each block and in what order**.
+- During a `GET`, S3 reconstructs the original byte stream **on the fly while streaming**, not by creating a second 200 GB file first.
+
 ---
 
 # How Durability Works
