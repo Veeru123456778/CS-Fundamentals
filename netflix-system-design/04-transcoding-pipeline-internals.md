@@ -890,6 +890,296 @@ It is never modified.
 
 ---
 
+
+## Deep Dive — How a Transcoding Worker Reads `master.mov` (Streaming From S3)
+
+This is one of the core internals of Netflix's transcoding pipeline.
+
+The worker **does not download a 200 GB file first**. It streams bytes from Object Storage while FFmpeg is decoding them.
+
+---
+
+# End-to-End Flow
+
+```mermaid
+sequenceDiagram
+    participant Worker
+    participant S3
+    participant Metadata
+    participant StorageNodes
+    participant FFmpeg
+
+    Worker->>S3: GET master.mov
+    S3->>Metadata: Lookup storage locations
+    Metadata-->>S3: Block IDs in order
+
+    loop Read Storage Blocks
+        S3->>StorageNodes: Read next storage block
+        StorageNodes-->>S3: Block bytes
+        S3-->>Worker: Byte stream
+        Worker-->>FFmpeg: Feed bytes continuously
+    end
+```
+
+---
+
+# Step 1 — Worker Requests `master.mov`
+
+The worker knows only the object key.
+
+```http
+GET /assets/movie_8472/master.mov
+```
+
+It does **not** know:
+
+- storage blocks,
+- storage nodes,
+- replication,
+- erasure coding.
+
+Those are hidden by S3.
+
+---
+
+# Step 2 — S3 Looks Up Object Metadata
+
+S3 reads the metadata for `master.mov`.
+
+### Metadata (Conceptual)
+
+| Field | Value |
+|-------|-------|
+| object_key | `master.mov` |
+| storage_locations | `blk101, blk102, blk103, ...` |
+| object_size | 200 GB |
+
+The metadata tells S3 the **ordered list of storage blocks**.
+
+---
+
+# Step 3 — S3 Reads Storage Blocks in Order
+
+Suppose metadata says:
+
+```text
+blk101
+blk102
+blk103
+blk104
+```
+
+These blocks may live on different storage nodes.
+
+| Storage Block | Storage Node |
+|---------------|--------------|
+| blk101 | Node A |
+| blk102 | Node F |
+| blk103 | Node C |
+| blk104 | Node B |
+
+S3 fetches them one after another.
+
+```text
+Read blk101 bytes
+Read blk102 bytes
+Read blk103 bytes
+Read blk104 bytes
+...
+```
+
+### Important
+
+The worker never receives blocks.
+
+It receives **one continuous byte stream**.
+
+---
+
+# Step 4 — Continuous Byte Stream
+
+Imagine the original movie looked like this.
+
+```text
+master.mov
+
+[Bytes 0-8KB][Bytes 8KB-16KB][Bytes 16KB-24KB]...
+```
+
+S3 streams bytes in exactly that order.
+
+```text
+Worker receives
+
+Bytes 0-8KB
+      ↓
+Bytes 8KB-16KB
+      ↓
+Bytes 16KB-24KB
+      ↓
+Bytes 24KB-32KB
+      ↓
+...
+```
+
+The worker sees it exactly like reading a normal file.
+
+**It doesn't know bytes came from different storage nodes.**
+
+---
+
+# Step 5 — Does the Worker Wait for the Entire 200 GB?
+
+**No.**
+
+Streaming starts immediately.
+
+### Example Timeline
+
+```text
+Second 0
+S3 sends first few MB.
+
+Second 1
+FFmpeg starts decoding.
+
+Second 2
+S3 sends next bytes.
+
+Second 3
+FFmpeg is already processing frames.
+```
+
+Reading and processing happen **simultaneously**.
+
+---
+
+# Step 6 — FFmpeg Reads Bytes Like a Pipe
+
+Think of S3 as a water pipe.
+
+```text
+S3 Byte Stream
+      │
+      ▼
+FFmpeg Input Buffer
+      ▼
+Decoder
+      ▼
+Frames
+```
+
+FFmpeg has an input buffer.
+
+It:
+
+1. reads some bytes,
+2. decodes them,
+3. asks for more bytes.
+
+### RAM Usage
+
+FFmpeg stores only:
+
+- input buffer,
+- decoder buffer,
+- few video frames.
+
+**Not the entire movie.**
+
+---
+
+# Step 7 — Decode → Scale → Encode (Streaming Pipeline)
+
+```mermaid
+flowchart LR
+    A["S3 Byte Stream"] --> B["Decoder"]
+    B --> C["Raw Frames"]
+    C --> D["Resize to 720p"]
+    D --> E["H.264 Encoder"]
+    E --> F["Encoded Bytes"]
+```
+
+Notice that FFmpeg processes **frames continuously**.
+
+It doesn't wait for all frames before encoding.
+
+---
+
+# Step 8 — Where Is The Output Written?
+
+The encoded output is written to a temporary local file.
+
+```text
+Worker Local SSD
+
+/tmp/job_720p/video.mp4
+```
+
+### Why Local SSD?
+
+Encoding produces bytes continuously.
+
+Writing to local disk is much faster than uploading every encoded byte to S3 immediately.
+
+---
+
+# Step 9 — Upload Back to S3
+
+After encoding completes, the worker uploads the generated file.
+
+```mermaid
+sequenceDiagram
+    participant Worker
+    participant S3
+
+    Worker->>S3: Multipart Upload 720p/video.mp4
+    S3-->>Worker: Upload Complete
+```
+
+### Important
+
+The output file is usually **much smaller** than the master.
+
+Example:
+
+| File | Size |
+|------|------|
+| master.mov | 200 GB |
+| 720p/video.mp4 | 2–5 GB |
+| 240p/video.mp4 | 400–800 MB |
+
+The worker uploads the **entire encoded rendition** (using multipart upload if needed).
+
+---
+
+# Why Not Upload While Encoding?
+
+Netflix could stream encoded bytes directly to storage, but workers typically produce a complete rendition first because:
+
+- upload retries are easier,
+- checksum verification is simpler,
+- FFmpeg failures don't leave partially visible outputs.
+
+The rendition becomes visible in Object Storage only after a successful upload.
+
+---
+
+# Important Intuition
+
+| Input Side | Output Side |
+|------------|-------------|
+| `master.mov` is **streamed from S3** as a continuous byte stream. | Encoded rendition is **written locally**, then uploaded as a complete object. |
+| Worker never stores 200 GB in RAM. | Output is a new object like `renditions/720p/video.mp4`. |
+| S3 reconstructs bytes from storage blocks transparently. | Upload uses normal object upload (often multipart if the rendition is large). |
+
+---
+
+## ⭐ One-Line Memory Note
+
+> **The transcoding worker streams `master.mov` from S3 block-by-block through FFmpeg's input buffer, processes frames continuously, writes the encoded rendition to local SSD, and finally uploads that rendition as a new object back to Object Storage.**
+
+
 # Next Chapter
 
 ## Part 6 — HLS/DASH Segmentation Internals
