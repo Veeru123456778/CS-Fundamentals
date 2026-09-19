@@ -1621,3 +1621,436 @@ Now segmentation becomes easy because every 2-second boundary already has an I-f
 - **Transcoding** decides where I-frames should exist (GOP structure).
 - **Segmentation** uses those I-frames as segment boundaries.
 - This guarantees every segment is independently decodable and enables seamless seeking and quality switching.
+
+
+
+# Netflix System Design — Part 7: CDN Distribution Internals (Origin → Open Connect)
+
+## Goal
+
+Understand how Netflix distributes streaming assets from Object Storage to CDN edge servers around the world.
+
+This chapter answers:
+
+- Why Object Storage is not used directly for user streaming.
+- What Origin Storage and CDN Edge Servers are.
+- Who triggers CDN distribution.
+- What gets copied to CDN.
+- How new movies become available globally.
+- How CDN cache updates when content changes.
+
+> **Scope:** Content distribution only. User playback starts in Part 8.
+
+---
+
+# Where We Left Off
+
+After segmentation finishes, Object Storage contains all streaming assets.
+
+```text
+assets/movie_8472/
+
+master.mov
+
+master.m3u8
+
+renditions/
+
+720p/
+    init.mp4
+    index.m3u8
+    segment_0001.m4s
+    segment_0002.m4s
+    ...
+
+1080p/
+    init.mp4
+    index.m3u8
+    segment_0001.m4s
+    ...
+```
+
+These assets exist only in **Origin Storage**.
+
+---
+
+# Why Can't Users Read From Object Storage?
+
+Imagine 250 million Netflix users request segments directly from Origin Storage.
+
+Problems:
+
+- Massive bandwidth from one storage system.
+- High latency for users in distant countries.
+- Origin becomes a bottleneck.
+- Every segment request travels across continents.
+
+Netflix solves this using **Open Connect CDN**.
+
+---
+
+# Origin Storage vs CDN
+
+| Origin Storage | CDN Edge Server |
+|----------------|-----------------|
+| Stores the source streaming assets. | Stores cached copies close to users. |
+| Used by internal services. | Used by Netflix clients. |
+| Few centralized locations. | Thousands of edge locations globally. |
+| Not optimized for millions of viewers. | Optimized for high-volume video delivery. |
+
+> **Important:** Origin Storage is the source of truth. CDN stores distributable copies.
+
+---
+
+# High-Level Distribution Pipeline
+
+```mermaid
+flowchart LR
+    Segmentation["Segmentation Worker"]
+    Origin[(Origin Object Storage)]
+    Distributor["CDN Distribution Service"]
+    Edge1["Open Connect - India"]
+    Edge2["Open Connect - US"]
+    Edge3["Open Connect - Europe"]
+
+    Segmentation --> Origin
+    Origin --> Distributor
+    Distributor --> Edge1
+    Distributor --> Edge2
+    Distributor --> Edge3
+```
+
+---
+
+# Step 1 — Segmentation Completion Triggers Distribution
+
+When **all renditions and manifests are ready**, Netflix creates a distribution job.
+
+Asset state changes.
+
+| Stage | Status |
+|-------|--------|
+| Segmentation Running | `PACKAGING` |
+| Segmentation Complete | `READY_FOR_DISTRIBUTION` |
+| CDN Distribution Running | `DISTRIBUTING` |
+| Distribution Complete | `READY_FOR_STREAMING` |
+
+The Segmentation Service emits an event.
+
+---
+
+# Step 2 — CDN Distribution Service
+
+Netflix has a dedicated service responsible for publishing assets to CDN.
+
+## Responsibilities
+
+- Read newly packaged assets.
+- Decide which CDN regions should receive them.
+- Create CDN distribution jobs.
+- Track distribution progress.
+
+This service **does not transfer files itself**.
+
+---
+
+# Step 3 — Distribution Jobs
+
+A separate job is created for every target region.
+
+### Example
+
+| Job | Region |
+|-----|--------|
+| Job A | India |
+| Job B | North America |
+| Job C | Europe |
+| Job D | Japan |
+
+### Example Job Payload
+
+```json
+{
+  "job_id": "dist_78291",
+  "asset_id": "movie_8472",
+  "region": "india",
+  "manifest": "assets/movie_8472/master.m3u8"
+}
+```
+
+---
+
+# Step 4 — Distribution Workers
+
+Workers consume CDN distribution jobs.
+
+```mermaid
+flowchart TD
+    Kafka["Kafka Topic: cdn-distribution-jobs"]
+    W1["Distribution Worker A"]
+    W2["Distribution Worker B"]
+    W3["Distribution Worker C"]
+
+    Kafka --> W1
+    Kafka --> W2
+    Kafka --> W3
+```
+
+Each worker handles one regional distribution job.
+
+---
+
+# Step 5 — What Files Are Copied?
+
+Netflix copies **streaming assets**, not `master.mov`.
+
+### Copied to CDN
+
+```text
+master.m3u8
+
+720p/
+    init.mp4
+    index.m3u8
+    segment_0001.m4s
+    segment_0002.m4s
+
+1080p/
+    init.mp4
+    index.m3u8
+    segment_0001.m4s
+```
+
+### Not Copied
+
+```text
+master.mov
+```
+
+The original master asset stays in Origin Storage.
+
+---
+
+# Why Isn't `master.mov` Copied?
+
+- Very large (200 GB).
+- Never streamed to users.
+- Needed only for future processing or re-encoding.
+
+CDN stores only playback assets.
+
+---
+
+# Step 6 — How Does Distribution Happen?
+
+The worker reads assets from Origin Storage.
+
+```text
+Origin Storage
+      │
+      ▼
+Distribution Worker
+      ▼
+Open Connect Edge Storage
+```
+
+Assets are uploaded into CDN storage buckets located in each region.
+
+---
+
+# Step 7 — Does Netflix Push Everything Everywhere?
+
+**Not always.**
+
+Netflix uses two strategies.
+
+## Strategy A — Pre-Populate (Popular Titles)
+
+Before release day:
+
+```text
+Origin
+   ↓
+Every CDN Region
+```
+
+Example:
+
+- Stranger Things Season Release.
+- Wednesday.
+- Squid Game.
+
+Assets are copied before users request them.
+
+### Benefit
+
+No cache misses on launch day.
+
+---
+
+## Strategy B — On-Demand Cache Fill
+
+Less popular content is copied only when requested.
+
+```text
+User Request
+      ↓
+CDN Miss
+      ↓
+Origin Fetch
+      ↓
+Cache Segment
+```
+
+This saves CDN storage.
+
+---
+
+# Step 8 — What Exists Inside a CDN Edge Server?
+
+Example:
+
+```text
+India Edge
+
+movie_8472/
+
+master.m3u8
+
+720p/
+segment_0001.m4s
+segment_0002.m4s
+
+1080p/
+segment_0001.m4s
+segment_0002.m4s
+```
+
+The edge server stores files exactly like Origin Storage, but only for that region.
+
+---
+
+# Step 9 — What If A Segment Isn't Cached?
+
+Example:
+
+```text
+User requests segment_0150.m4s
+```
+
+Edge lookup:
+
+```text
+Cache Miss
+```
+
+Edge requests Origin Storage.
+
+```text
+Origin
+   ↓
+segment_0150.m4s
+   ↓
+Edge caches it
+   ↓
+User receives segment
+```
+
+Next user gets a cache hit.
+
+---
+
+# Step 10 — Cache Invalidation
+
+Suppose Netflix updates subtitles or re-encodes a movie.
+
+### Version Changes
+
+Old path:
+
+```text
+movie_8472/v1/
+```
+
+New path:
+
+```text
+movie_8472/v2/
+```
+
+The manifest now points to **v2**.
+
+Old CDN entries naturally expire or are removed.
+
+### Why Version Instead of Overwriting?
+
+- No stale caches.
+- Existing viewers continue using v1.
+- New viewers receive v2 immediately.
+
+---
+
+# CDN Distribution State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> READY_FOR_DISTRIBUTION
+    READY_FOR_DISTRIBUTION --> DISTRIBUTING
+    DISTRIBUTING --> READY_FOR_STREAMING
+    DISTRIBUTING --> FAILED
+    FAILED --> DISTRIBUTING
+```
+
+---
+
+# Failure Scenarios
+
+| Scenario | Netflix Behavior |
+|----------|------------------|
+| Region unavailable | Retry distribution later. |
+| CDN upload fails | Retry distribution job. |
+| One region succeeds, another fails | Regions operate independently. |
+| New version released | CDN receives new version path. |
+
+---
+
+# Final Storage Architecture
+
+```text
+Origin Storage
+
+master.mov
+
+Streaming Assets
+├── master.m3u8
+├── 240p/
+├── 360p/
+├── 720p/
+└── 1080p/
+
+        │
+        │ Distribution
+        ▼
+
+Open Connect CDN (Global)
+
+India Edge
+US Edge
+Europe Edge
+Japan Edge
+...
+```
+
+---
+
+# Key Takeaways
+
+- Origin Storage is the **source of truth** for streaming assets.
+- CDN stores copies of **segments and manifests**, not `master.mov`.
+- Segmentation completion triggers CDN distribution jobs.
+- Distribution workers copy assets region-by-region.
+- Popular content is often **pre-populated** into CDN before release.
+- Less popular content is fetched on the first cache miss and cached afterward.
+- Versioned asset paths make CDN cache invalidation simple and safe.
+
+---
