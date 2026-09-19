@@ -1473,14 +1473,149 @@ Streaming uses **segments**, not `video.mp4`.
 
 ---
 
-# Next Chapter
 
-## Part 7 — Netflix Player Internals (Adaptive Bitrate Streaming)
+# Step 0 — Who Triggers Segmentation?
 
-We'll follow one user clicking **Play** and understand:
+Segmentation is **not** done by the upload service or orchestrator directly.
 
-- Which manifest is downloaded first.
-- How the player selects 720p vs 1080p.
-- How quality switches happen without buffering.
-- HTTP requests for every segment.
-- Buffer management and seeking.
+It is a separate stage in the media pipeline.
+
+## Pipeline Flow
+
+```mermaid
+flowchart LR
+    A["Transcoding Worker"] --> B["720p/video.mp4 uploaded"]
+    B --> C["Segmentation Orchestrator"]
+    C --> D["Kafka Topic: segmentation-jobs"]
+    D --> E["Segmentation Workers"]
+    E --> F["720p Segments + index.m3u8"]
+```
+
+### Why a Separate Service?
+
+Netflix separates encoding and segmentation because they are independent, scalable stages.
+
+- Transcoding = convert video quality.
+- Segmentation = package video for streaming.
+
+This allows each stage to scale independently.
+
+---
+
+## Step 1 — Segmentation Jobs Are Created
+
+When a transcoding worker successfully uploads `720p/video.mp4`:
+
+1. Job status becomes `COMPLETED`.
+2. Segmentation Orchestrator receives this event.
+3. It creates a segmentation job for that rendition.
+
+### Example Job
+
+```json
+{
+  "asset_id": "movie_8472",
+  "rendition": "720p",
+  "object_key": "assets/movie_8472/renditions/720p/video.mp4",
+  "segment_duration_seconds": 2,
+  "format": "HLS"
+}
+```
+
+Every rendition gets its own segmentation job.
+
+| Rendition | Segmentation Job |
+|-----------|------------------|
+| 240p | Job A |
+| 360p | Job B |
+| 720p | Job C |
+| 1080p | Job D |
+
+Workers process these jobs in parallel.
+
+---
+
+## Step 2 — Who Decides Segment Duration?
+
+The **Segmentation Orchestrator** decides it based on Netflix's encoding profile.
+
+Example configuration:
+
+| Profile | Segment Duration |
+|---------|------------------|
+| Movies | 2 seconds |
+| TV Episodes | 4 seconds |
+| Live Streaming | 1–2 seconds |
+
+The duration is part of the job configuration sent to workers.
+
+---
+
+## Step 3 — How Does the Worker Know Where Segment Boundaries Are?
+
+This is the important part.
+
+**The worker does not simply cut every 2 seconds by timestamp.**
+
+It cuts at the **nearest keyframe (I-frame)**.
+
+### Example Timeline
+
+```text
+Time (seconds)
+
+0    2    4    6    8
+|----|----|----|----|
+
+I    P P  I P P  I P
+```
+
+Desired segments:
+
+| Segment | Actual Start |
+|---------|--------------|
+| Segment 1 | 0s (I-frame) |
+| Segment 2 | 4s (next I-frame) |
+| Segment 3 | 8s (next I-frame) |
+
+### Why?
+
+A segment must begin with a complete frame.
+
+Starting at a P-frame would require frames from the previous segment to decode it.
+
+---
+
+## Step 4 — How Are Keyframes Created?
+
+During **transcoding**, FFmpeg is instructed to insert keyframes at fixed intervals.
+
+Example:
+
+```text
+Frame Rate = 24 FPS
+Segment Duration = 2 seconds
+
+Keyframe Interval = 48 frames
+```
+
+So FFmpeg generates:
+
+```text
+Frame 0   → I-frame
+Frame 48  → I-frame
+Frame 96  → I-frame
+Frame 144 → I-frame
+```
+
+Now segmentation becomes easy because every 2-second boundary already has an I-frame.
+
+> **Important:** Netflix doesn't hope keyframes exist naturally; it controls keyframe placement during encoding.
+
+---
+
+## Important Intuition
+
+- **Transcoding** decides where I-frames should exist (GOP structure).
+- **Segmentation** uses those I-frames as segment boundaries.
+- This guarantees every segment is independently decodable and enables seamless seeking and quality switching.
