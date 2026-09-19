@@ -1116,6 +1116,8 @@ Worker Local SSD
 /tmp/job_720p/video.mp4
 ```
 
+FFmpeg is configured with a fixed GOP (Group of Pictures) interval so that an I-frame is inserted every segment duration (for example, every 2 seconds). This is done specifically to make later HLS/DASH segmentation possible. (Because we need to start with an I Frame while making segments of a video)
+
 ### Why Local SSD?
 
 Encoding produces bytes continuously.
