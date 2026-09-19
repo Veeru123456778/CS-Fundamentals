@@ -27,9 +27,9 @@ Video segments (`.m4s`, `init.mp4`, `.m3u8`) are downloaded over **HTTPS**.
 
 Each segment is a separate GET request and player fetches each segment individually:
 
-GET /720p/segment_0001.m4s
-GET /720p/segment_0002.m4s
-GET /720p/segment_0003.m4s
+- GET /720p/segment_0001.m4s
+- GET /720p/segment_0002.m4s
+- GET /720p/segment_0003.m4s
 
 # End-to-End Playback Flow
 
