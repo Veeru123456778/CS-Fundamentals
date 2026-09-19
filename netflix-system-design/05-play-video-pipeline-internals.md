@@ -361,14 +361,440 @@ This minimizes startup latency.
 
 ---
 
+
+# Netflix System Design — Part 9: Netflix Player Internals (Adaptive Bitrate, Buffering & Seeking)
+
+## Goal
+
+Understand what happens **inside the Netflix player** after the first frame starts playing.
+
+This chapter covers:
+
+- How the player chooses video quality.
+- How adaptive bitrate (ABR) switching works.
+- How buffering works.
+- How seeking works.
+- How segment downloads happen continuously.
+
+> **Scope:** Client-side playback logic only.
+
+---
+
+# High-Level Player Architecture
+
+```mermaid
+flowchart LR
+    CDN["Netflix CDN"]
+    Player["Netflix Player"]
+    Buffer["Playback Buffer"]
+    Decoder["Video Decoder"]
+    Screen["Screen"]
+
+    CDN --> Player
+    Player --> Buffer
+    Buffer --> Decoder
+    Decoder --> Screen
+```
+
+The player continuously downloads segments while simultaneously playing previously downloaded segments.
+
+---
+
+# Step 1 — Player Maintains a Playback Buffer
+
+The player never plays directly from the network.
+
+Instead it stores downloaded segments in memory.
+
+## Example
+
+```text
+Playback Timeline
+
+Playing → Segment 10
+
+Buffer
+
+Segment 11
+Segment 12
+Segment 13
+```
+
+### Important
+
+Playback consumes Segment 10 while Segments 11–13 are downloading.
+
+---
+
+# How Much Does Netflix Buffer?
+
+Typical values (conceptual):
+
+| Situation | Buffer Ahead |
+|-----------|--------------|
+| Startup | 2–6 seconds |
+| Stable Playback | 20–60 seconds |
+| Slow Network | Smaller buffer |
+
+The player continuously adjusts buffer size.
+
+---
+
+# Step 2 — Download Loop
+
+The player runs a continuous download loop.
+
+```mermaid
+flowchart TD
+    A["Playback Starts"] --> B["Download Next Segment"]
+    B --> C["Append To Buffer"]
+    C --> D["Play Buffered Segment"]
+    D --> B
+```
+
+Example:
+
+```text
+Play Segment 10
+
+Download Segment 11
+Download Segment 12
+
+Play Segment 11
+
+Download Segment 13
+```
+
+Downloads and playback happen simultaneously.
+
+---
+
+# Step 3 — Adaptive Bitrate (ABR)
+
+The player measures current network bandwidth.
+
+### Inputs Used
+
+| Signal | Example |
+|--------|---------|
+| Segment download speed | 18 Mbps |
+| Buffer health | 30 seconds buffered |
+| Device resolution | 1080p display |
+| CPU capability | Can decode 1080p? |
+
+The player selects the highest safe quality.
+
+---
+
+# Example ABR Decision
+
+| Network Speed | Player Chooses |
+|--------------|----------------|
+| 0.8 Mbps | 240p |
+| 2 Mbps | 480p |
+| 5 Mbps | 720p |
+| 10 Mbps | 1080p |
+| 25 Mbps | 4K |
+
+The player changes quality dynamically.
+
+---
+
+# Step 4 — How Bandwidth Is Estimated
+
+The player measures every segment download.
+
+### Example
+
+```text
+Segment Size = 1 MB
+
+Downloaded In = 0.5 seconds
+
+Estimated Bandwidth = 16 Mbps
+```
+
+It continuously updates this estimate after every segment.
+
+---
+
+# Step 5 — Switching Quality
+
+Suppose playback starts at 720p.
+
+Buffer currently contains:
+
+```text
+720p
+
+Segment 11
+Segment 12
+Segment 13
+```
+
+Network becomes faster.
+
+Player downloads future segments from 1080p.
+
+```text
+720p
+
+Segment 11
+Segment 12
+
+1080p
+
+Segment 13
+Segment 14
+Segment 15
+```
+
+### Important
+
+Already buffered segments remain 720p.
+
+Only future segments switch quality.
+
+This makes switching seamless.
+
+---
+
+# Step 6 — Why Switching Is Smooth
+
+All renditions were segmented using the same timeline.
+
+```text
+240p
+
+Segment 15 → 28s–30s
+
+720p
+
+Segment 15 → 28s–30s
+
+1080p
+
+Segment 15 → 28s–30s
+```
+
+Segment numbers represent the **same playback time** across all qualities.
+
+The player simply changes the URL.
+
+Example:
+
+```text
+Before
+
+720p/segment_0015.m4s
+
+After
+
+1080p/segment_0015.m4s
+```
+
+Playback continues without restarting.
+
+---
+
+# Step 7 — Buffer Underflow
+
+Suppose the network becomes slow.
+
+Buffer shrinks.
+
+```text
+Playing Segment 20
+
+Buffer
+
+Segment 21
+```
+
+If Segment 22 isn't downloaded in time:
+
+```text
+Buffer Empty
+```
+
+Playback pauses.
+
+The player shows buffering.
+
+---
+
+# Step 8 — Recovery From Buffering
+
+The player reduces quality.
+
+Example:
+
+```text
+720p → 480p
+```
+
+Smaller segments download faster.
+
+Buffer fills again.
+
+Playback resumes.
+
+---
+
+# Step 9 — Seeking
+
+User jumps to **1 hour 23 minutes**.
+
+### Step 1
+
+Player converts timestamp to segment number.
+
+Example:
+
+```text
+Segment Duration = 2 seconds
+
+1:23:00
+
+4980 seconds
+
+4980 / 2 = Segment 2490
+```
+
+### Step 2
+
+Request new segment.
+
+```http
+GET /720p/segment_2490.m4s
+```
+
+### Step 3
+
+Discard old buffer.
+
+### Step 4
+
+Start buffering from Segment 2490 onward.
+
+Seeking is just downloading a different segment.
+
+---
+
+# Step 10 — Fast Forward / Rewind
+
+Example:
+
+```text
+Jump +30 seconds
+
+Current Segment = 120
+
+New Segment = 135
+```
+
+Player starts requesting segments from 135.
+
+No previous segments are downloaded again.
+
+---
+
+# Step 11 — Segment Retry Strategy
+
+If a segment download fails:
+
+### Retry Order
+
+1. Retry same CDN edge.
+2. Retry another CDN edge.
+3. Drop quality.
+4. Pause playback if retries fail.
+
+This happens per segment.
+
+---
+
+# Step 12 — Playback Events
+
+The player continuously emits events.
+
+| Event | Purpose |
+|-------|---------|
+| Playback Started | Analytics |
+| Segment Downloaded | QoE metrics |
+| Buffering Started | Quality monitoring |
+| Buffering Ended | QoE metrics |
+| Seeked | Playback state |
+| Playback Progress | Continue Watching |
+
+These events are sent asynchronously and never block playback.
+
+---
+
+# Complete Runtime Timeline
+
+```text
+Play Click
+
+Download master.m3u8
+Download index.m3u8
+Download init.mp4
+
+Download Segment 1
+Download Segment 2
+
+Playback Starts
+
+Download Segment 3
+Download Segment 4
+...
+
+Network Slow
+
+Switch 720p → 480p
+
+Continue Playback
+
+User Seeks
+
+Download Segment 2490
+
+Continue Playback
+```
+
+---
+
+# Failure Scenarios
+
+| Scenario | Player Behavior |
+|----------|-----------------|
+| Slow network | Switch to lower bitrate. |
+| CDN timeout | Retry another CDN endpoint. |
+| Segment download fails | Retry segment before buffering. |
+| Buffer empty | Pause playback until buffer refills. |
+| User changes quality manually | Future segments use selected quality. |
+
+---
+
+# Key Takeaways
+
+- The player always plays from a **buffer**, never directly from the network.
+- It continuously downloads upcoming segments while playing buffered ones.
+- ABR decisions are made after measuring bandwidth and buffer health.
+- Quality switches happen **only for future segments**.
+- Seeking simply maps a timestamp to a segment number and starts downloading from there.
+- Playback events are emitted asynchronously for analytics and resume playback.
+
+---
+
 # Next Chapter
 
-## Part 9 — Netflix Player Internals (Adaptive Bitrate, Buffering, Seeking)
+## Part 10 — Continue Watching & Playback Progress Pipeline
 
-We'll deep dive into:
+We'll build the backend pipeline for:
 
-- How the player measures bandwidth.
-- When it switches from 720p to 1080p.
-- Buffer management.
-- Seeking to 1 hour 23 minutes.
-- Parallel segment downloads and retry strategy.
+- Saving playback position.
+- Resume playback across devices.
+- Kafka events.
+- Redis + Database.
+- Exactly-once progress updates.
