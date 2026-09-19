@@ -17,6 +17,14 @@ This chapter covers:
 
 ---
 
+### Transport Protocol
+
+Video segments (`.m4s`, `init.mp4`, `.m3u8`) are downloaded over **HTTPS**.
+
+- **Application protocol:** HTTP (HLS/DASH uses normal HTTP GET requests).
+- **Transport protocol:** TCP for HTTP/1.1 and HTTP/2, or QUIC (UDP) when using HTTP/3.
+- Each segment is fetched as a separate HTTPS GET request from the CDN.
+
 # End-to-End Playback Flow
 
 ```mermaid
