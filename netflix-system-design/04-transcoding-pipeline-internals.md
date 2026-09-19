@@ -1180,14 +1180,307 @@ The rendition becomes visible in Object Storage only after a successful upload.
 > **The transcoding worker streams `master.mov` from S3 block-by-block through FFmpeg's input buffer, processes frames continuously, writes the encoded rendition to local SSD, and finally uploads that rendition as a new object back to Object Storage.**
 
 
+
+# Netflix System Design — Part 6: HLS/DASH Segmentation Internals
+
+## Goal
+
+Understand how Netflix converts each encoded rendition (`720p/video.mp4`, `1080p/video.mp4`, etc.) into streaming assets that can be played instantly, seeked, and switched between qualities.
+
+This chapter covers:
+
+- Why Netflix doesn't stream `video.mp4` directly.
+- How videos are divided into 2–6 second segments.
+- What keyframes are and why segment boundaries matter.
+- How `.m3u8` (HLS) and `.mpd` (DASH) manifest files are generated.
+- What gets stored in Object Storage after segmentation.
+
+---
+
+# Where We Left Off
+
+After transcoding, Object Storage contains complete encoded videos.
+
+```text
+assets/movie_8472/renditions/
+
+240p/video.mp4
+360p/video.mp4
+480p/video.mp4
+720p/video.mp4
+1080p/video.mp4
+4k/video.mp4
+```
+
+These are **complete MP4 files**.
+
+Users still don't stream these files directly.
+
+---
+
+# Why Not Stream `video.mp4` Directly?
+
+Imagine a 2-hour movie.
+
+```text
+720p/video.mp4
+Size ≈ 3 GB
+Duration = 2 hours
+```
+
+Problems:
+
+- User has to request one huge file.
+- Seeking to 1 hour requires jumping inside a large file.
+- Switching from 720p to 1080p becomes difficult.
+- CDN caching is inefficient.
+
+Netflix instead streams **small video segments**.
+
+---
+
+# Step 1 — Segment Every Rendition
+
+Each rendition is cut into equal-duration pieces.
+
+### Example (2-second segments)
+
+```text
+720p/video.mp4
+
+0-2 sec
+2-4 sec
+4-6 sec
+6-8 sec
+...
+7198-7200 sec
+```
+
+Each segment becomes an independent file.
+
+```text
+720p/
+
+segment_0001.m4s
+segment_0002.m4s
+segment_0003.m4s
+...
+segment_3600.m4s
+```
+
+### Important
+
+Segmentation happens **independently for every rendition**.
+
+```text
+240p/
+360p/
+480p/
+720p/
+1080p/
+4k/
+```
+
+Every quality has its own segment files.
+
+---
+
+# Why 2–6 Second Segments?
+
+Typical segment duration is **2–6 seconds**.
+
+| Smaller Segments | Larger Segments |
+|------------------|-----------------|
+| Faster quality switching. | Better compression efficiency. |
+| Lower startup latency. | Fewer HTTP requests. |
+| More CDN requests. | Higher buffering delay. |
+
+Netflix chooses a duration that balances latency and efficiency.
+
+---
+
+# Step 2 — What Is a Keyframe?
+
+A video contains different frame types.
+
+| Frame Type | Meaning |
+|------------|---------|
+| I-frame | Complete image. |
+| P-frame | Stores changes from previous frame. |
+| B-frame | Stores changes from surrounding frames. |
+
+### Important
+
+A segment **must start with an I-frame**.
+
+Otherwise playback cannot start from that segment.
+
+---
+
+# Why Segment Boundaries Start at Keyframes
+
+Wrong segmentation:
+
+```text
+Segment 2 starts at a P-frame.
+```
+
+The player cannot decode it without previous frames.
+
+Correct segmentation:
+
+```text
+I-frame
+P-frame
+P-frame
+P-frame
+
+<Next Segment>
+
+I-frame
+P-frame
+P-frame
+```
+
+Every segment starts with an independent decode point.
+
+---
+
+# Step 3 — Segment Generation
+
+FFmpeg creates thousands of segment files.
+
+### Example Output
+
+```text
+assets/movie_8472/renditions/720p/
+
+init.mp4
+segment_0001.m4s
+segment_0002.m4s
+segment_0003.m4s
+...
+```
+
+### What is `init.mp4`?
+
+It contains initialization metadata.
+
+The player downloads it once before downloading segments.
+
+---
+
+# Step 4 — Generate Manifest File
+
+Netflix generates one manifest for every rendition.
+
+### Example
+
+```text
+720p/index.m3u8
+```
+
+Contents (conceptually):
+
+```text
+segment_0001.m4s
+segment_0002.m4s
+segment_0003.m4s
+...
+```
+
+This tells the player the playback order.
+
+---
+
+# Step 5 — Generate Master Manifest
+
+A master playlist references every quality.
+
+```text
+master.m3u8
+
+240p/index.m3u8
+360p/index.m3u8
+480p/index.m3u8
+720p/index.m3u8
+1080p/index.m3u8
+4k/index.m3u8
+```
+
+This is the first file downloaded by Netflix clients.
+
+The player now knows every available quality.
+
+---
+
+# Final Object Storage Layout
+
+```text
+assets/movie_8472/
+
+master.mov
+
+renditions/
+
+240p/
+    init.mp4
+    index.m3u8
+    segment_0001.m4s
+    ...
+
+360p/
+    init.mp4
+    index.m3u8
+    segment_0001.m4s
+    ...
+
+720p/
+    init.mp4
+    index.m3u8
+    segment_0001.m4s
+    ...
+
+1080p/
+    init.mp4
+    index.m3u8
+    segment_0001.m4s
+    ...
+
+master.m3u8
+```
+
+---
+
+# Why Keep `video.mp4`?
+
+Usually Netflix doesn't stream this file.
+
+It is primarily an intermediate encoded asset that can be regenerated or reused if segmentation needs to change.
+
+Streaming uses **segments**, not `video.mp4`.
+
+---
+
+# Key Takeaways
+
+- Netflix **first creates renditions**, then segments every rendition.
+- Every segment represents a fixed duration (typically 2–6 seconds).
+- Every segment starts at a keyframe.
+- `init.mp4` contains initialization metadata for that rendition.
+- `index.m3u8` lists all segments for one quality.
+- `master.m3u8` lists every available quality and becomes the entry point for playback.
+
+---
+
 # Next Chapter
 
-## Part 6 — HLS/DASH Segmentation Internals
+## Part 7 — Netflix Player Internals (Adaptive Bitrate Streaming)
 
-We'll learn:
+We'll follow one user clicking **Play** and understand:
 
-- Why `720p/video.mp4` is still not streamed directly.
-- How Netflix cuts videos into 2-second segments.
-- `.m3u8` playlists and manifest generation.
-- Keyframes and why segment boundaries matter.
-- How adaptive bitrate streaming works.
+- Which manifest is downloaded first.
+- How the player selects 720p vs 1080p.
+- How quality switches happen without buffering.
+- HTTP requests for every segment.
+- Buffer management and seeking.
