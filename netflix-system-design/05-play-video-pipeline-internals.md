@@ -25,6 +25,12 @@ Video segments (`.m4s`, `init.mp4`, `.m3u8`) are downloaded over **HTTPS**.
 - **Transport protocol:** TCP for HTTP/1.1 and HTTP/2, or QUIC (UDP) when using HTTP/3.
 - Each segment is fetched as a separate HTTPS GET request from the CDN.
 
+Each segment is a separate GET request and player fetches each segment individually:
+
+GET /720p/segment_0001.m4s
+GET /720p/segment_0002.m4s
+GET /720p/segment_0003.m4s
+
 # End-to-End Playback Flow
 
 ```mermaid
