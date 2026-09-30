@@ -10,3 +10,9 @@ When you build a RESTful API, you are using HTTP as your transport layer.
 • HTTP provides the verbs: GET, POST, PUT, DELETE.
 • REST provides the meaning: It dictates that GET /users should strictly fetch data, POST /users should create a new user, and the server shouldn't remember your past requests (statelessness).
 
+
+HTTP runs on top of TCP.
+
+Some servers only supports some HTTP methods only.
+
+HTTP payloads are not optimized and huge and may have a overhead.
