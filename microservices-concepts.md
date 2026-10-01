@@ -41,10 +41,28 @@ So we can share the database initially it is fine.
 - If db is down only affect the dependent microservices.
 
 - Granular control of scaling of service and db.
- 
+
 
 ## Disadvantages of having different db per service:
 
 - Cross service transactions are omplex and expensive. (For transactions need to implement 2 phase commit across services)
 
 - Multiple infra components to be monitored and managed
+
+
+## Distributed Transactions 
+
+# 2 Phase Commit:
+
+This consist of two steps:
+
+1. Reserve - We should first reserve the things that we need means suppose we need to do multiple things but atomically so instead of directly commiting we will firstly see that can we reserve the resources first across all the services. 
+In this we acquire a lock on the resource along with a timer so that if anything goes wrong or even if service itself goes down then we can release the locks when the timer ends.
+
+2. Commit - Now after reserving all the resources we need to actually commit those and needs to assign those resources across microservices so that we can finally send the succcess response to the user that we have completed all the steps within the transaction. 
+
+This is how we implement the two phase commit protocol across distributed systems to make the transactions and to execute all steps atomically.
+
+# If service fails during assignment:
+
+Also if at the time of assignment of the resource if the server crashes then we can recover that with retry mechanism and it will not be having much impact on our side.
