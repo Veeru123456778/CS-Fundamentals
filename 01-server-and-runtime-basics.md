@@ -412,6 +412,72 @@ This is the complete request lifecycle on a **single server**.
 
 ---
 
+## How sockets gets created when a connection gets made between client-server:
+
+Yes, sockets are directly responsible for sending and receiving data.
+
+In a client-server architecture, they act as the standard interface (or "door") between your application logic and the network.
+
+How They Handle Data
+
+• Sending: Your application writes data into the socket. The OS kernel copies this data into the socket's send buffer, packages it into network packets, and transmits it over the physical network.
+
+• Reading: When packets arrive from the network, the OS kernel processes them and places the payload into the socket's receive buffer. Your application then reads the data out of this buffer to process it.
+
+Without sockets, applications would have to manually manage raw network hardware, IP routing, and packet reassembly.
+
+# Here is exactly how Redis coordinates this behind the scenes using the underlying operating system:
+
+1. Sockets as OS Handles (File Descriptors)
+
+In Linux/Unix systems, everything is a file. When a client connects to Redis, the OS creates a socket and hands Redis a File Descriptor (FD)—which is just an integer handle representing that 
+specific socket connection. If Redis has 10,000 active clients, it has 10,000 socket FDs sitting in its memory.
+
+2. The Watchlist (I/O Multiplexing)
+Instead of manually looping through all 10,000 sockets to check "Do you have a query? Do you? How about you?" (which would destroy CPU performance), Redis leverages native OS multiplexing system calls like epoll (on Linux) or kqueue (on macOS).
+
+- Redis bundles all 10,000 socket handles together and passes them to the OS kernel via a system call (epoll_ctl), essentially telling the kernel: "Watch these 10,000 sockets for me. Tell me the exact moment data arrives on any of them."
+
+3. Going to Sleep and The Wake-up Event
+
+Once the watchlist is registered, the single Redis thread calls epoll_wait() and goes to sleep. It consumes practically zero CPU while waiting.
+
+• When a client finally sends a query, the network card receives the packets, and the OS kernel fills that specific socket's receive buffer.
+
+• The kernel immediately wakes up the Redis thread and hands it a list containing only the specific socket handles that are actually ready to be read.
+
+4. Lightning-Fast Execution
+Redis wakes up, iterates through that short list of ready handles one by one, reads the query data from the socket, executes the command in memory, writes the response back to the socket, and immediately goes back to sleep waiting for the next network event.
+
+Because it offloads the "listening and waiting" to the OS kernel, a single Redis thread can gracefully handle immense scale.
+
+1. Are they the interfaces created on connection?
+
+Yes. A socket is the literal software interface (API boundary) between the application layer and the networking layer. The moment a TCP handshake completes, the OS instantiates this socket endpoint to represent that specific connection.
+
+
+2. Are they the first to send and receive request/response?
+
+From the application's perspective, yes. To Redis or any web server, the socket is the absolute first point of contact. However, if we look at the physical machine, the Network Interface Card (NIC) and the OS Kernel receive the raw electricity/light/packets first, but they immediately push that data directly into the socket.
+3. Do they convert raw network packets into a suitable format?
+
+
+Yes, via the OS Network Stack.
+
+• When sending, the socket takes your application's clean data (like a raw string text GET user:100) and the OS wraps it into TCP segments, encapsulates it into IP packets, and turns it into ethernet frames.
+
+• When receiving, the OS strips away all the complex network headers (MAC addresses, IP routing headers, TCP sequence numbers) and reassembles fragmented packets back into a continuous, clean stream of bytes inside the socket. The application doesn't have to worry about network packet layouts at all.
+
+
+4. Do they have buffers in them for write and read capacity?
+
+Yes, absolutely. Every TCP socket is automatically allocated two dedicated regions of OS kernel memory:
+
+• The Receive Buffer (SO_RCVBUF): When network packets arrive, the OS reassembles them here. The data sits in this buffer until the application calls read() or recv() to pull it out. If the application is busy, this buffer acts as a waiting room.
+
+• The Send Buffer (SO_SNDBUF): When the application calls write() or send(), the data is copied here. The OS then streams the data out onto the network as fast as the network speed and congestion controls allow.
+
+
 # Interview Takeaways
 
 - A server is a computer optimized for serving requests continuously.
