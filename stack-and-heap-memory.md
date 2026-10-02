@@ -11,6 +11,8 @@
 
 • Not shared: Stack space is isolated per function call (and per thread), meaning one function cannot directly peek into another active function's private stack frame easily without passing pointers or references.
 
+• Stack Space is much smaller than heap so we should not allocate many big objects in this stack space and dynamic memory is useful for allocation of large objects. 
+
 # Heap Space
 
 • Shared/Global pool: The heap is a common, large region of memory shared by the entire program or process.
