@@ -1,4 +1,4 @@
-## Postgres
+# Postgres
 
 PostgreSQL uses a process-based architecture where it spawns a completely separate operating system process (using fork) for each client connection, managed by a main postgres postmaster supervisor process.
 
