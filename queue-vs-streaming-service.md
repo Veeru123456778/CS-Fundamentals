@@ -1,5 +1,16 @@
 # Message Queue vs. Message Streaming
 
+## Message Queue vs. Message Streaming
+
+A **message queue** primarily manages messages as pending tasks to be processed, typically by one of several competing consumers. After successful acknowledgement, a message is generally removed from the pending workload.
+
+A **message streaming service** stores an ordered sequence of events for a configured retention period, allowing consumers to track their own progress and independently replay retained events.
+
+**Key difference:** A message queue primarily focuses on **work distribution**, whereas a message streaming service primarily focuses on **event retention and independent consumption**.
+
+**Note:** This is a conceptual distinction, not an absolute rule. Technologies such as Kafka and RabbitMQ support capabilities that overlap these models.
+
+
 ## 1. Why Do We Need Message Queues and Message Streaming?
 
 Consider an e-commerce application where a user places an order.
